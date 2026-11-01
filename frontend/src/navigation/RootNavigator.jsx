@@ -50,7 +50,9 @@ export const RootNavigator = () => {
   }
 
   return (
-    <NavigationContainer ref={navigationRef}>
+    // navigationInChildEnabled: lets a stack screen open a tab directly (LiveJourney's SOS button, the sidebar).
+    // React Navigation 7 no longer does this by default, and the press would silently do nothing.
+    <NavigationContainer ref={navigationRef} navigationInChildEnabled>
       <SidebarProvider>
         {isAuthenticated || user ? (
           isProfileComplete ? (

@@ -123,8 +123,8 @@ export const NotificationsScreen = ({ navigation }) => {
           }
         >
           {filteredItems.map(item => {
-            const isSos = item.type === 'sos' || item.title?.toLowerCase().includes('sos');
-            const isWarning = item.type === 'warning' || item.title?.toLowerCase().includes('warning');
+            const isSos = ['SOS', 'SAFETY_CHECK'].includes(typeOf(item)) || item.title?.toLowerCase().includes('sos');
+            const isWarning = typeOf(item) === 'GEOFENCE' || item.title?.toLowerCase().includes('warning');
             const itemKey = item._id || item.id || Math.random().toString();
 
             return (

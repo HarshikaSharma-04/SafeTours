@@ -5,6 +5,7 @@ const ApiError = require('../utils/apiError');
 const ApiResponse = require('../utils/apiResponse');
 const asyncHandler = require('../utils/asyncHandler');
 const { generateAccessToken, generateRefreshToken } = require('../utils/token');
+const passwordResetService = require('../services/passwordResetService');
 
 // ─── Cookie options ───────────────────────────────────────────────────────────
 const cookieOptions = {
@@ -136,6 +137,33 @@ const refreshToken = asyncHandler(async (req, res) => {
   );
 });
 
+// ─── POST /logout ─────────────────────────────────────────────────────────────
+// Revokes the refresh token so it cannot be used again. Idempotent: an unknown token is not an error.
+const logout = asyncHandler(async (req, res) => {
+  const incomingToken = req.cookies?.refreshToken || req.body?.refreshToken;
+  if (incomingToken) await RefreshToken.deleteOne({ token: incomingToken });
+
+  res.clearCookie('accessToken', cookieOptions);
+  res.clearCookie('refreshToken', cookieOptions);
+  return res.status(200).json(new ApiResponse(200, null, 'Logged out'));
+});
+
+// ─── POST /forgot-password ────────────────────────────────────────────────────
+// Answers the same way whether or not the account exists (no user enumeration).
+const forgotPassword = asyncHandler(async (req, res) => {
+  await passwordResetService.requestReset(req.body.email);
+  return res.status(200).json(
+    new ApiResponse(200, null, 'If that email has an account, a reset code has been sent')
+  );
+});
+
+// ─── POST /reset-password ─────────────────────────────────────────────────────
+const resetPassword = asyncHandler(async (req, res) => {
+  const { email, code, password } = req.body;
+  await passwordResetService.resetPassword(email, code, password);
+  return res.status(200).json(new ApiResponse(200, null, 'Password updated. Please log in'));
+});
+
 // ─── GET /me (protected) ──────────────────────────────────────────────────────
 const getMe = asyncHandler(async (req, res) => {
   // req.user is already attached (and password-stripped) by verifyJWT middleware
@@ -144,4 +172,4 @@ const getMe = asyncHandler(async (req, res) => {
   );
 });
 
-module.exports = { signup, login, refreshToken, getMe };
+module.exports = { signup, login, refreshToken, logout, forgotPassword, resetPassword, getMe };

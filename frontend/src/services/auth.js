@@ -37,6 +37,28 @@ export const authService = {
   },
 
   /**
+   * POST /api/auth/logout
+   * Revokes the refresh token on the server.
+   */
+  logout: async refreshToken => {
+    await apiClient.post('/auth/logout', { refreshToken }, { timeout: 5000 });
+  },
+
+  /**
+   * POST /api/auth/forgot-password
+   */
+  forgotPassword: async email => {
+    await apiClient.post('/auth/forgot-password', { email });
+  },
+
+  /**
+   * POST /api/auth/reset-password
+   */
+  resetPassword: async ({ email, code, password }) => {
+    await apiClient.post('/auth/reset-password', { email, code, password });
+  },
+
+  /**
    * POST /api/auth/refresh-token
    * @param {string} refreshToken 
    */

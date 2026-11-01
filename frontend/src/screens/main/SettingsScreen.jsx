@@ -284,7 +284,10 @@ export const SettingsScreen = () => {
                     <SettingsRow 
                         icon="document-text" 
                         title="Terms of Service & Privacy" 
-                        onPress={() => {}}
+                        onPress={() => Alert.alert(
+                            'Terms and Privacy',
+                            'SafeTours is a decision aid, not an emergency service: in danger, call 112. Risk levels are estimates from the data shown in the app. Your location, profile, medical details and emergency contacts are stored on the SafeTours server and shared with your contacts only when an SOS is sent. Chat history stays on this phone. Map data © OpenStreetMap contributors; imagery © Esri.'
+                        )}
                     />
                 </View>
 

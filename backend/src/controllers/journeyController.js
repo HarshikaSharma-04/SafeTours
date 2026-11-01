@@ -112,9 +112,32 @@ const getJourneyStatus = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/journey/history
+ * Retrieves the user's journeys, newest first.
+ */
+const getJourneyHistory = async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    const journeys = await journeyService.getJourneyHistory(req.user._id, limit);
+    return res.status(200).json({
+      success: true,
+      message: 'Journey history retrieved successfully.',
+      journeys
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve journey history.',
+      error: error.message
+    });
+  }
+};
+
 module.exports = {
   startJourney,
   updateJourney,
   endJourney,
-  getJourneyStatus
+  getJourneyStatus,
+  getJourneyHistory
 };

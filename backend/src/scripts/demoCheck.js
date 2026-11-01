@@ -14,6 +14,7 @@
  */
 const path = require('path');
 require('dotenv').config({ path: path.resolve(__dirname, '../../.env'), quiet: true });
+require('../config/envAliases');
 const mongoose = require('mongoose');
 
 mongoose.set('autoIndex', false); // must be set before the models are loaded

@@ -23,7 +23,7 @@ class JourneyService {
         throw new Error('User already has an active journey. Please complete or cancel it first.');
       }
 
-      const { startLocation, destination, expectedArrivalTime } = data;
+      const { startLocation, destination, expectedArrivalTime, destinationName } = data;
       const newJourney = new Journey({
         userId,
         startLocation: { type: 'Point', coordinates: startLocation },
@@ -31,6 +31,7 @@ class JourneyService {
         lastKnownLocation: { type: 'Point', coordinates: startLocation },
         expectedArrivalTime,
         status: 'ACTIVE',
+        ...(destinationName ? { metadata: { destinationName } } : {}),
       });
       return await newJourney.save();
     } catch (error) {
@@ -103,6 +104,16 @@ class JourneyService {
     } catch (error) {
       logger.error(`[JourneyService.getJourneyStatus] user ${userId}: ${error.message}`);
       throw new Error('Failed to retrieve journey status.');
+    }
+  }
+
+  /** The user's journeys, newest first, active and finished alike. */
+  async getJourneyHistory(userId, limit = 50) {
+    try {
+      return await Journey.find({ userId }).sort({ startTime: -1 }).limit(limit).lean();
+    } catch (error) {
+      logger.error(`[JourneyService.getJourneyHistory] user ${userId}: ${error.message}`);
+      throw new Error('Failed to retrieve journey history.');
     }
   }
 

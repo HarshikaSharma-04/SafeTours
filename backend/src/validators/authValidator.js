@@ -76,7 +76,47 @@ const validateLogin = (req, res, next) => {
   next();
 };
 
+/**
+ * Validate Forgot Password Request
+ */
+const validateForgotPassword = (req, res, next) => {
+  const { email } = req.body;
+  if (!email || typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email.trim())) {
+    return next(new ApiError(400, 'Validation failed', [{ field: 'email', message: 'Please provide a valid email address' }]));
+  }
+  req.body.email = email.trim().toLowerCase();
+  next();
+};
+
+/**
+ * Validate Reset Password Request
+ */
+const validateResetPassword = (req, res, next) => {
+  const { email, code, password } = req.body;
+  const errors = [];
+
+  if (!email || typeof email !== 'string' || !/^\S+@\S+\.\S+$/.test(email.trim())) {
+    errors.push({ field: 'email', message: 'Please provide a valid email address' });
+  }
+  if (typeof code !== 'string' || !/^\d{6}$/.test(code.trim())) {
+    errors.push({ field: 'code', message: 'The reset code has 6 digits' });
+  }
+  if (!password || typeof password !== 'string' || password.length < 6) {
+    errors.push({ field: 'password', message: 'Password must be at least 6 characters long' });
+  }
+
+  if (errors.length > 0) {
+    return next(new ApiError(400, 'Validation failed', errors));
+  }
+
+  req.body.email = email.trim().toLowerCase();
+  req.body.code = code.trim();
+  next();
+};
+
 module.exports = {
   validateSignup,
   validateLogin,
+  validateForgotPassword,
+  validateResetPassword,
 };

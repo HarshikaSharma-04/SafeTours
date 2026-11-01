@@ -10,7 +10,8 @@ const {
   startJourney,
   updateJourney,
   endJourney,
-  getJourneyStatus
+  getJourneyStatus,
+  getJourneyHistory
 } = require('../controllers/journeyController');
 
 // Import validators
@@ -71,6 +72,16 @@ router.get(
   '/status',
   verifyJWT,
   getJourneyStatus
+);
+
+/**
+ * GET /api/journey/history
+ * Retrieves the user's journeys, newest first.
+ */
+router.get(
+  '/history',
+  verifyJWT,
+  getJourneyHistory
 );
 
 module.exports = router;

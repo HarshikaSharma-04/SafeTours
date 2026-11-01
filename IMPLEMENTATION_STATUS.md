@@ -1,6 +1,6 @@
 # SafeTours IPD: Implementation Status and Handover
 
-Written 2026-10-07 after Phase 6B; Phase 7 section added 2026-10-11 (read section 4b first for the newest state). Give this file, the Core Features document and the Integration document to a new reader (or a new AI session) and they should be able to continue the work.
+Written 2026-10-07 after Phase 6B; Phase 7 section added 2026-10-11, flow fixes added 2026-11-01 (see "Flow fixes" in section 4, and ARCHITECTURE.md for how everything works). Give this file, the Core Features document and the Integration document to a new reader (or a new AI session) and they should be able to continue the work.
 
 **How to read it:** the repository is the source of truth. Where this file and the code disagree, trust the code. Statements are marked **[verified]** (an automated test or a build confirmed it), **[written, untested]** (code exists, only parsed or unit-tested), or **[not on a device]** (needs a real phone, which nobody has run yet).
 
@@ -102,6 +102,18 @@ D:\Desktop\IPD-1\SafeTours_IPD_NodeJS
 - **Phone:** new AISafetyAssistantScreen (real messages, loading/error states, AI vs offline label, quick prompts, proposal card, Clear), offline answers from cached risk/nearby via the shared rules file, Home "Safety tips" from real data (no AI call), community contribution in the risk detail chips, report categories from the server list.
 - Tests now: backend 213, frontend 88. Env: `GEMINI_API_KEY`, `GEMINI_MODEL` (+ optional `GEMINI_TIMEOUT_MS`, `ASSISTANT_PER_MINUTE`, `ASSISTANT_PER_HOUR`).
 - Two shared files now need syncing after edits: `npm run sync:device-core` copies `deviceCore.js` and `assistantRules.js`.
+
+### Flow fixes (2026-11-01)
+- **Map engine replaced.** `react-native-maps` (needed a Google key in the Android build, none exists) is gone. `components/MapComponent.jsx` keeps its props but renders Leaflet with OpenStreetMap tiles in a WebView (`map/mapHtml.js`, `map/leafletBundle.js`; run `node scripts/buildLeafletBundle.js` after upgrading Leaflet). No key. **A development build must be rebuilt** (`react-native-webview`); Expo Go already includes it. This replaces the Phase 6A notes about Google Maps and `mapType` none.
+- **Map screen:** cells follow the camera and include SAFE; a tapped cell shows its own score and factors; search suggestions keep their coordinates; denied location permission can browse the map; a note explains an empty map.
+- **New endpoints:** `GET /api/journey/history`, `POST /api/auth/logout`, `/forgot-password`, `/reset-password`, `GET /api/places/search`, `GET /api/places/route` (env `ORS_API_KEY`, optional `SMTP_*`).
+- **Journeys:** destination is searched by name, not typed as coordinates; route, ETA estimate, risk along the route, real progress, arrival sync in the foreground.
+- **Sessions:** a dropped connection no longer logs the user out, at startup or during a token refresh.
+- **Navigation:** `navigationInChildEnabled` on the container: stack screens could not open tabs on React Navigation 7, so the journey SOS button and sidebar silently did nothing from them.
+- **Dead controls fixed:** Share Location (Map, Home, SOS share sheet), Forgot Password (screen was not registered and its service did not exist), Terms row, repeat SOS from Home (only the first press fired), notification icons (type casing), a setting mislabelled as fall detection.
+- `OWM_API_KEY` is accepted for `OPENWEATHER_API_KEY` (`config/envAliases.js`).
+- **Crime data is still missing:** `preprocessing/crime_clean.csv` has only 2 rows inside the Mumbai box, so `crime:build` refuses it. Everything else in the risk score is working as designed.
+- Tests: backend 226, frontend 95, plus a 90-check API run on a throwaway MongoDB. **Still not run on a phone.**
 
 ---
 

@@ -19,7 +19,8 @@ import { getRiskColors } from '../../components/MapComponent';
 import { DemoBadge } from '../../components/DemoBadge';
 import { NearbyServicesCard } from '../../components/NearbyServicesCard';
 import { SafetyTips } from '../../components/SafetyTips';
-import { ensureWatching } from '../../utils/locationWatcher';
+import { ensureWatching, getBestPosition } from '../../utils/locationWatcher';
+import { shareLocation } from '../../utils/shareLocation';
 import { useConnectivity } from '../../context/ConnectivityContext';
 import { formatAge } from '../../utils/geo';
 import { useOutbox } from '../../context/OutboxContext';
@@ -60,7 +61,10 @@ export const HomeScreen = () => {
                     throw new Error('Location permission is required to load your safety summary.');
                 }
                 ensureWatching();
-                const location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+                const location = await getBestPosition();
+                if (!location) {
+                    throw new Error('Your location is not available yet. Turn on GPS and pull back to this screen.');
+                }
                 locationRef.current = location.coords;
             }
             const { latitude, longitude } = locationRef.current;
@@ -142,6 +146,9 @@ export const HomeScreen = () => {
                 {loadError ? (
                     <InfoCard style={styles.heroCard}>
                         <Text variant="bodyMd" color={colors.error}>{loadError}</Text>
+                        <TouchableOpacity onPress={loadDashboard} style={{ marginTop: spacing.sm }}>
+                            <Text variant="labelLg" color={colors.primary} style={{ fontWeight: 'bold' }}>Try again</Text>
+                        </TouchableOpacity>
                     </InfoCard>
                 ) : (
                     <GlassCard style={styles.heroCard}>
@@ -228,7 +235,7 @@ export const HomeScreen = () => {
                 <View style={styles.quickActions}>
                     <Text variant="headlineSm" style={styles.sectionTitle}>Quick Actions</Text>
                     <View style={styles.actionGrid}>
-                        <TouchableOpacity style={styles.actionBtn} onPress={() => navigation.navigate('LiveJourney')}>
+                        <TouchableOpacity style={styles.actionBtn} onPress={() => shareLocation(locationRef.current)}>
                             <View style={styles.actionIconWrapper}>
                                 <Ionicons name="location" size={24} color={colors.primary} />
                             </View>
@@ -255,7 +262,7 @@ export const HomeScreen = () => {
 
             {/* Floating SOS Button */}
             <View style={styles.floatingSosContainer}>
-                <SOSButton onPress={() => navigation.navigate('SOS', { triggerSOS: true })} size={64} style={styles.floatingSos} />
+                <SOSButton onPress={() => navigation.navigate('SOS', { triggerRequestId: Date.now() })} size={64} style={styles.floatingSos} />
             </View>
         </Screen>
     );

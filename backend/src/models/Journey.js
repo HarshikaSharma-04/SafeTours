@@ -62,6 +62,9 @@ const journeySchema = new mongoose.Schema({
   },
   // Future fields are cleanly isolated in a metadata object
   metadata: {
+    destinationName: {
+      type: String, // What the user searched for; the destination itself is the GeoJSON point above
+    },
     route: {
       type: String, // E.g., an Encoded Polyline string to draw the path on a map
     },

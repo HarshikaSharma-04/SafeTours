@@ -89,6 +89,10 @@ export const LoginScreen = () => {
             />
           </View>
 
+          <TouchableOpacity style={styles.forgotLink} onPress={() => navigation.navigate('ForgotPassword')} disabled={isBusy}>
+            <Text variant="labelLg" color={colors.primary}>Forgot password?</Text>
+          </TouchableOpacity>
+
           <View style={styles.footer}>
             <Button
               title="Log In"
@@ -110,6 +114,10 @@ export const LoginScreen = () => {
 };
 
 const styles = StyleSheet.create({
+  forgotLink: {
+    alignSelf: 'flex-end',
+    paddingVertical: spacing.sm,
+  },
   screen: {
     flex: 1,
   },

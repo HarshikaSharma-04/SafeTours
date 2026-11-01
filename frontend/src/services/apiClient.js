@@ -114,6 +114,9 @@ const reportOutcome = (config, status, hadResponse) => {
   connectivityBus.reportRequest({ ok: !failed, ms });
 };
 
+// False when there was no refresh token to try at all (as opposed to a request that failed).
+const storedRefreshTokenWasUsable = refreshErr => refreshErr.message !== 'No refresh token available';
+
 apiClient.interceptors.response.use(
   response => {
     reportOutcome(response.config, response.status, true);
@@ -127,7 +130,10 @@ apiClient.interceptors.response.use(
     const isAuthRoute =
       originalRequest?.url?.includes('/auth/login') ||
       originalRequest?.url?.includes('/auth/signup') ||
-      originalRequest?.url?.includes('/auth/refresh-token');
+      originalRequest?.url?.includes('/auth/refresh-token') ||
+      originalRequest?.url?.includes('/auth/logout') ||
+      originalRequest?.url?.includes('/auth/forgot-password') ||
+      originalRequest?.url?.includes('/auth/reset-password');
 
     if (error.response?.status === 401 && originalRequest && !originalRequest._retry && !isAuthRoute) {
       if (isRefreshing) {
@@ -151,9 +157,11 @@ apiClient.interceptors.response.use(
         }
 
         // Call backend refresh token endpoint
-        const refreshResponse = await axios.post(`${BASE_URL}/auth/refresh-token`, {
-          refreshToken: storedRefreshToken,
-        });
+        const refreshResponse = await axios.post(
+          `${BASE_URL}/auth/refresh-token`,
+          { refreshToken: storedRefreshToken },
+          { timeout: 15000 }
+        );
 
         const { accessToken, refreshToken: newRefreshToken } = refreshResponse.data.data;
 
@@ -169,10 +177,16 @@ apiClient.interceptors.response.use(
         return apiClient(originalRequest);
       } catch (refreshErr) {
         processQueue(refreshErr, null);
-        await tokenStorage.clearTokens();
-        setAuthTokenHeader(null);
-        if (onUnauthorizedCallback) {
-          onUnauthorizedCallback();
+        // Only the server saying no ends the session. A dropped connection or a server error must not sign the
+        // user out: this is a safety app, and the moment the signal goes is when it matters most.
+        const status = refreshErr.response?.status;
+        const sessionIsOver = !storedRefreshTokenWasUsable(refreshErr) || status === 400 || status === 401;
+        if (sessionIsOver) {
+          await tokenStorage.clearTokens();
+          setAuthTokenHeader(null);
+          if (onUnauthorizedCallback) {
+            onUnauthorizedCallback();
+          }
         }
         return Promise.reject(refreshErr);
       } finally {
@@ -206,7 +220,9 @@ export const formatApiError = error => {
 
   const data = error.response.data || {};
   const status = error.response.status;
-  const message = data.message || (status === 401 ? 'Unauthorized session' : 'An error occurred');
+  // The journey and community endpoints put the useful sentence in `error` and a generic one in `message`.
+  const specific = status < 500 && typeof data.error === 'string' ? data.error : null;
+  const message = specific || data.message || (status === 401 ? 'Unauthorized session' : 'An error occurred');
 
   const fieldErrors = {};
   if (Array.isArray(data.errors)) {

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, ScrollView, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, ScrollView, TouchableOpacity, StyleSheet } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { Screen } from '../../components/Screen';
 import { Text } from '../../components/Text';
@@ -7,6 +7,18 @@ import { DataState } from '../../components/DataState';
 import { journeyService } from '../../services/journeys';
 
 import { colors, spacing, shapes } from '../../theme/theme';
+
+const STATUS_ICON = {
+  ACTIVE: { name: 'navigate-circle', color: colors.primary },
+  COMPLETED: { name: 'checkmark-circle', color: colors.tertiary },
+  CANCELLED: { name: 'close-circle', color: colors.outline },
+};
+
+const destinationLabel = (item) => {
+  if (item.metadata?.destinationName) return item.metadata.destinationName;
+  const [lng, lat] = item.destination?.coordinates || [];
+  return Number.isFinite(lat) && Number.isFinite(lng) ? `${lat.toFixed(4)}, ${lng.toFixed(4)}` : 'Unknown destination';
+};
 
 export const JourneyHistoryScreen = ({ navigation }) => {
 
@@ -16,11 +28,11 @@ export const JourneyHistoryScreen = ({ navigation }) => {
   const load = async () => {
     setError('');
     setItems(null);
-    try {
-      const journeys = await journeyService.list();
-      setItems(journeys);
-    } catch (e) {
-      setError(e?.message || 'Failed to load journey history.');
+    const res = await journeyService.list();
+    if (res.success) {
+      setItems(res.journeys);
+    } else {
+      setError(res.error?.message || 'Failed to load journey history.');
     }
   };
 
@@ -44,32 +56,46 @@ export const JourneyHistoryScreen = ({ navigation }) => {
       {!items ? (
         <DataState loading={!error} error={error} onRetry={load} />
       ) : items.length === 0 ? (
-        <DataState empty emptyText="No active or recorded journeys found." />
+        <DataState empty emptyText="No journeys yet. Your active and finished journeys will appear here." />
       ) : (
         <ScrollView contentContainerStyle={styles.content}>
-          {items.map((item, index) => (
-            <TouchableOpacity 
-              key={item._id || item.id || `journey-${index}`} 
-              style={styles.card} 
-              onPress={() => navigation.navigate('LiveJourney')}
-            >
-              <Ionicons name="navigate-circle" size={28} color={colors.primary} />
-              <View style={{ flex: 1 }}>
-                <Text variant="labelLg" style={{ fontWeight: 'bold' }}>
-                  Journey #{item._id ? item._id.substring(0, 8) : index + 1}
-                </Text>
-                <Text color={colors['on-surface-variant']}>
-                  Status: {item.status || 'ACTIVE'}
-                </Text>
-                {item.expectedArrivalTime && (
-                  <Text variant="labelMd" color={colors.outline}>
-                    ETA: {new Date(item.expectedArrivalTime).toLocaleString()}
+          {items.map((item, index) => {
+            const isActive = item.status === 'ACTIVE';
+            const icon = STATUS_ICON[item.status] || STATUS_ICON.ACTIVE;
+            return (
+              <TouchableOpacity
+                key={item._id || item.id || `journey-${index}`}
+                style={styles.card}
+                onPress={() => navigation.navigate('LiveJourney')}
+                disabled={!isActive}
+              >
+                <Ionicons name={icon.name} size={28} color={icon.color} />
+                <View style={{ flex: 1 }}>
+                  <Text variant="labelLg" style={{ fontWeight: 'bold' }} numberOfLines={1}>
+                    {destinationLabel(item)}
                   </Text>
-                )}
-              </View>
-              <Ionicons name="chevron-forward" size={20} color={colors.outline} />
-            </TouchableOpacity>
-          ))}
+                  <Text color={colors['on-surface-variant']}>
+                    {item.status}{item.metadata?.arrived ? ' · arrived' : ''}
+                  </Text>
+                  {item.startTime && (
+                    <Text variant="labelMd" color={colors.outline}>
+                      Started: {new Date(item.startTime).toLocaleString()}
+                    </Text>
+                  )}
+                  {item.endTime ? (
+                    <Text variant="labelMd" color={colors.outline}>
+                      Ended: {new Date(item.endTime).toLocaleString()}
+                    </Text>
+                  ) : item.expectedArrivalTime ? (
+                    <Text variant="labelMd" color={colors.outline}>
+                      ETA: {new Date(item.expectedArrivalTime).toLocaleString()}
+                    </Text>
+                  ) : null}
+                </View>
+                {isActive && <Ionicons name="chevron-forward" size={20} color={colors.outline} />}
+              </TouchableOpacity>
+            );
+          })}
         </ScrollView>
       )}
     </Screen>

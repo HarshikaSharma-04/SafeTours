@@ -197,7 +197,7 @@ export const ProfileScreen = () => {
 
           <Section title="Emergency settings" />
           <Toggle label="Share Live Location with Contacts" value={Boolean(form.settings.shareLiveLocationWithContacts)} onValueChange={value => updateSettings('shareLiveLocationWithContacts', value)} disabled={saving} />
-          <Toggle label="Auto SOS on Fall Detection" value={Boolean(form.settings.autoSosOnFall)} onValueChange={value => updateSettings('autoSosOnFall', value)} disabled={saving} />
+          <Toggle label="Ask if I am safe when I enter a high-risk area" value={Boolean(form.settings.autoSosOnFall)} onValueChange={value => updateSettings('autoSosOnFall', value)} disabled={saving} />
           <Toggle label="Low Battery Alert" value={Boolean(form.settings.lowBatteryAlert)} onValueChange={value => updateSettings('lowBatteryAlert', value)} disabled={saving} />
           <Toggle label="Quiet Hours Enabled" value={Boolean(form.settings.quietHoursEnabled)} onValueChange={value => updateSettings('quietHoursEnabled', value)} disabled={saving} />
         </View>

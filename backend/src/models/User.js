@@ -46,6 +46,15 @@ const userSchema = new mongoose.Schema(
       type: Object,
       default: {},
     },
+    // Password reset: only a hash of the 6-digit code is stored. select:false keeps these out of every normal query.
+    passwordReset: {
+      type: {
+        codeHash: { type: String },
+        expiresAt: { type: Date },
+        attempts: { type: Number, default: 0 },
+      },
+      select: false,
+    },
     // Authorisation role. Promote a user with: npm run user:role -- <email> admin
     role: {
       type: String,

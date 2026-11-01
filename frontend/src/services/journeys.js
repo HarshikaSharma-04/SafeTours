@@ -7,7 +7,7 @@ import { sendOrQueue } from './outbox';
 export const journeyService = {
   /**
    * Starts a new active journey.
-   * @param {Object} data - { startLocation: [lng, lat], destination: [lng, lat], expectedArrivalTime }
+   * @param {Object} data - { startLocation: [lng, lat], destination: [lng, lat], expectedArrivalTime, destinationName? }
    */
   async start(data) {
     try {
@@ -94,13 +94,14 @@ export const journeyService = {
   },
 
   /**
-   * Helper alias for listing user journey history/active journey
+   * The user's journeys, newest first, active and finished alike.
    */
   async list() {
-    const res = await this.getActive();
-    if (res.success && res.journey) {
-      return [res.journey];
+    try {
+      const response = await apiClient.get('/journey/history');
+      return { success: true, journeys: response.data?.journeys || [] };
+    } catch (error) {
+      return { success: false, journeys: [], error: formatApiError(error) };
     }
-    return [];
   },
 };

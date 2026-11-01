@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Platform, View, StyleSheet, TouchableOpacity, TextInput, Dimensions, ActivityIndicator, Linking, ScrollView, Modal } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, TextInput, Dimensions, ActivityIndicator, Linking, ScrollView, Modal } from 'react-native';
 import { Screen } from '../../components/Screen';
 import { Text } from '../../components/Text';
 import { colors, spacing, shapes, typography } from '../../theme/theme';
@@ -10,6 +10,7 @@ import { MapComponent, getRiskColors } from '../../components/MapComponent';
 import { riskService } from '../../services/riskService';
 import { formatScore, confidenceText, dataQualityNote, factorLabel } from '../../utils/riskLevels';
 import { locationService } from '../../services/locationService';
+import { placesService } from '../../services/places';
 import { communityService } from '../../services/communityService';
 import { geofenceManager, calculateDistanceMeters } from '../../utils/geofenceManager';
 import { LocationStatusModal } from '../../components/LocationStatusModal';
@@ -20,7 +21,9 @@ import { OpenChip, nearbyStatusText, typeMeta } from '../../components/NearbyPar
 import { callNumber, openDirections, sanitizePhone } from '../../utils/placeActions';
 import { formatDistance, formatAge } from '../../utils/geo';
 import { useConnectivity } from '../../context/ConnectivityContext';
-import { ensureWatching } from '../../utils/locationWatcher';
+import { ensureWatching, getBestPosition } from '../../utils/locationWatcher';
+import { locationBus } from '../../utils/locationBus';
+import { shareLocation } from '../../utils/shareLocation';
 import { useSidebar } from '../../context/SidebarContext';
 
 const { width, height } = Dimensions.get('window');
@@ -31,6 +34,20 @@ const DEFAULT_REGION = {
     longitude: 72.8347,
     latitudeDelta: 0.03,
     longitudeDelta: 0.03,
+};
+
+// Risk cells are loaded around the camera. The radius follows the zoom, within limits that keep a request small.
+const MIN_CELL_RADIUS_M = 1500;
+const MAX_CELL_RADIUS_M = 6000;
+const CAMERA_RELOAD_DISTANCE_M = 800;
+const CAMERA_RELOAD_DELAY_MS = 700;
+const METERS_PER_DEGREE_LAT = 111320;
+// Keeps the OpenStreetMap credit above the bottom sheet, where it stays readable.
+const MAP_BOTTOM_INSET = 230;
+
+const cellRadiusFor = (region) => {
+    const half = (Number(region?.latitudeDelta) || 0.03) * METERS_PER_DEGREE_LAT * 0.6;
+    return Math.min(MAX_CELL_RADIUS_M, Math.max(MIN_CELL_RADIUS_M, half));
 };
 
 const FACTOR_ICONS = {
@@ -100,7 +117,7 @@ export const SafetyMapScreen = ({ route }) => {
     const [suggestions, setSuggestions] = useState([]);
     const [isSuggestionsLoading, setIsSuggestionsLoading] = useState(false);
     const [destination, setDestination] = useState(null); // { latitude, longitude, name, address }
-    const [destinationRisk, setDestinationRisk] = useState(null); // nearby danger zones for destination
+    const [destinationRisk, setDestinationRisk] = useState(null); // high-risk cells near the destination
     const [destinationDistance, setDestinationDistance] = useState(null); // meters from user
     const [showDestinationPanel, setShowDestinationPanel] = useState(false);
     const autocompleteTimerRef = useRef(null);
@@ -129,6 +146,7 @@ export const SafetyMapScreen = ({ route }) => {
     
     // Tracking & Permission states
     const [permissionStatus, setPermissionStatus] = useState('checking'); // checking, granted, denied, permanently_denied, disabled, error
+    const [browseWithoutLocation, setBrowseWithoutLocation] = useState(false);
     const [trackingActive, setTrackingActive] = useState(false);
     const [isLoadingLocation, setIsLoadingLocation] = useState(false);
     const [errorMessage, setErrorMessage] = useState(null);
@@ -138,6 +156,10 @@ export const SafetyMapScreen = ({ route }) => {
     const [selectedZone, setSelectedZone] = useState(null);
     const [isLoadingDangerZones, setIsLoadingDangerZones] = useState(false);
     const [dangerZoneError, setDangerZoneError] = useState(null);
+    const [cellCoverage, setCellCoverage] = useState(null); // what the last cell request found: { scanned, unknownCells }
+    const [selectedZoneRisk, setSelectedZoneRisk] = useState(null); // full risk of the tapped cell
+    const [isZoneRiskLoading, setIsZoneRiskLoading] = useState(false);
+    const [tilesFailed, setTilesFailed] = useState(false);
 
     // Geofencing UI Feedback Toast
     const [geofenceToast, setGeofenceToast] = useState(null);
@@ -170,9 +192,11 @@ export const SafetyMapScreen = ({ route }) => {
     const mapPlaces = (nearby?.places || []).filter((p) => visibleTypes.has(p.type)).slice(0, 80);
 
     const mapRef = useRef(null);
-    const locationSubscription = useRef(null);
     const lastSyncedCoords = useRef(null);
-    const autocompleteTimerRef2 = autocompleteTimerRef; // alias for clarity in cleanup
+    const cameraRef = useRef(DEFAULT_REGION); // where the map is looking now; the risk cells follow it
+    const lastCellCenter = useRef(null);
+    const cameraTimerRef = useRef(null);
+    const searchSeq = useRef(0); // only the newest search may show its results
 
     // ── Destination Search Handlers ────────────────────────────────────────────
 
@@ -203,8 +227,8 @@ export const SafetyMapScreen = ({ route }) => {
     };
 
     /**
-     * Debounced autocomplete: fires geocode suggestions ~500ms after user stops typing.
-     * Uses expo-location geocodeAsync which is available without an extra API key.
+     * Debounced autocomplete: asks for suggestions ~500 ms after the user stops typing.
+     * Each suggestion already has its coordinates, so picking one never has to search again.
      */
     const handleSearchTextChange = (text) => {
         setSearchQuery(text);
@@ -224,146 +248,76 @@ export const SafetyMapScreen = ({ route }) => {
             clearTimeout(autocompleteTimerRef.current);
         }
 
+        const seq = ++searchSeq.current;
         if (!text || text.trim().length < 2) {
             setSuggestions([]);
+            setIsSuggestionsLoading(false);
             return;
         }
 
         setIsSuggestionsLoading(true);
         autocompleteTimerRef.current = setTimeout(async () => {
-            try {
-                const results = await Location.geocodeAsync(text.trim());
-                if (results && results.length > 0) {
-                    // Reverse-geocode each candidate to get a readable address
-                    const enriched = await Promise.all(
-                        results.slice(0, 5).map(async (r) => {
-                            try {
-                                const [place] = await Location.reverseGeocodeAsync({
-                                    latitude: r.latitude,
-                                    longitude: r.longitude,
-                                });
-                                const name = place
-                                    ? [place.name, place.district, place.city, place.region, place.country]
-                                          .filter(Boolean)
-                                          .join(', ')
-                                    : `${r.latitude.toFixed(5)}, ${r.longitude.toFixed(5)}`;
-                                return { latitude: r.latitude, longitude: r.longitude, name };
-                            } catch {
-                                return {
-                                    latitude: r.latitude,
-                                    longitude: r.longitude,
-                                    name: `${r.latitude.toFixed(5)}, ${r.longitude.toFixed(5)}`,
-                                };
-                            }
-                        })
-                    );
-                    // Deduplicate by rounded coordinate
-                    const seen = new Set();
-                    const unique = enriched.filter((s) => {
-                        const key = `${s.latitude.toFixed(4)}_${s.longitude.toFixed(4)}`;
-                        if (seen.has(key)) return false;
-                        seen.add(key);
-                        return true;
-                    });
-                    setSuggestions(unique);
-                } else {
-                    setSuggestions([]);
-                }
-            } catch (err) {
-                console.warn('[Autocomplete] geocode error:', err);
-                setSuggestions([]);
-            } finally {
-                setIsSuggestionsLoading(false);
-            }
+            const res = await placesService.search(text, userLocation);
+            if (seq !== searchSeq.current) return;
+            setSuggestions(res.data || []);
+            setIsSuggestionsLoading(false);
         }, 500);
     };
 
+    /** Puts the camera, the marker and the risk panel on a chosen place. */
+    const showDestination = async (place) => {
+        const { latitude, longitude } = place;
+        const dest = {
+            latitude,
+            longitude,
+            name: place.name || searchQuery,
+            address: place.address || `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`,
+        };
+        setDestination(dest);
+        setSearchQuery(dest.name);
+
+        const destRegion = { latitude, longitude, latitudeDelta: 0.02, longitudeDelta: 0.02 };
+        setMapRegion(destRegion);
+        mapRef.current?.animateToRegion(destRegion, 1000);
+
+        if (userLocation) {
+            setDestinationDistance(calculateDistanceMeters(userLocation.latitude, userLocation.longitude, latitude, longitude));
+        }
+
+        fetchDestinationRiskData(latitude, longitude);
+
+        const riskRes = await riskService.getCellsAround(latitude, longitude, 3000, 'HIGH');
+        setDestinationRisk(riskRes.success ? riskRes.data || [] : []);
+
+        // Location details open only when the user taps the marker or "View Details".
+        setShowDestinationPanel(false);
+    };
+
     /**
-     * Called when user taps a suggestion or submits the search bar.
-     * Geocodes the query, moves the camera, places a destination marker,
-     * and fetches calculated location risk score from backend score-service.
+     * Called when the user submits the search bar: uses the top suggestion for what they typed.
      */
-    const handleSearchDestination = async (overrideQuery = null) => {
-        const query = (overrideQuery || searchQuery).trim();
+    const handleSearchDestination = async () => {
+        const query = searchQuery.trim();
         if (!query) return;
 
-        // Dismiss suggestions & keyboard
+        if (autocompleteTimerRef.current) clearTimeout(autocompleteTimerRef.current);
+        searchSeq.current += 1;
         setSuggestions([]);
+        setIsSuggestionsLoading(false);
         setIsSearchFocused(false);
         setIsSearching(true);
         setSearchError(null);
         setShowDestinationPanel(false);
 
         try {
-            const results = await Location.geocodeAsync(query);
-            if (!results || results.length === 0) {
+            const res = await placesService.search(query, userLocation);
+            if (!res.success) {
+                setSearchError(res.error?.message || 'Place search is not available right now.');
+            } else if (!res.data.length) {
                 setSearchError(`No location found for "${query}". Please try a different search.`);
-                setIsSearching(false);
-                return;
-            }
-
-            const { latitude, longitude } = results[0];
-
-            // Reverse-geocode for display
-            let placeName = query;
-            let fullAddress = `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
-            try {
-                const [place] = await Location.reverseGeocodeAsync({ latitude, longitude });
-                if (place) {
-                    placeName = place.name || place.district || place.city || query;
-                    fullAddress = [
-                        place.streetNumber,
-                        place.street,
-                        place.district,
-                        place.city,
-                        place.region,
-                        place.postalCode,
-                        place.country,
-                    ]
-                        .filter(Boolean)
-                        .join(', ');
-                }
-            } catch {}
-
-            const dest = { latitude, longitude, name: placeName, address: fullAddress };
-            setDestination(dest);
-            setSearchQuery(placeName);
-
-            // Animate camera to destination
-            const destRegion = {
-                latitude,
-                longitude,
-                latitudeDelta: 0.02,
-                longitudeDelta: 0.02,
-            };
-            setMapRegion(destRegion);
-            mapRef.current?.animateToRegion(destRegion, 1000);
-
-            // Distance from user's current location
-            if (userLocation) {
-                const dist = calculateDistanceMeters(
-                    userLocation.latitude,
-                    userLocation.longitude,
-                    latitude,
-                    longitude
-                );
-                setDestinationDistance(dist);
-            }
-
-            // Fetch calculated single-source-of-truth location risk score from backend score-service
-            fetchDestinationRiskData(latitude, longitude);
-
-            // Fetch nearby danger zones for the destination
-            const riskRes = await riskService.getCellsAround(latitude, longitude, 3000, 'HIGH');
-            if (riskRes.success) {
-                setDestinationRisk(riskRes.data || []);
             } else {
-                setDestinationRisk([]);
+                await showDestination(res.data[0]);
             }
-
-            // Do not show location details automatically upon search.
-            // Display them only when the user taps the marker or selects "View Details".
-            setShowDestinationPanel(false);
         } catch (err) {
             console.error('[Destination Search] Error:', err);
             setSearchError('An error occurred while searching. Please try again.');
@@ -381,13 +335,14 @@ export const SafetyMapScreen = ({ route }) => {
     };
 
     /**
-     * Tap a suggestion chip → set query and immediately geocode
+     * Tap a suggestion: its coordinates are already known.
      */
     const handleSelectSuggestion = (suggestion) => {
-        setSearchQuery(suggestion.name);
+        searchSeq.current += 1;
         setSuggestions([]);
         setIsSearchFocused(false);
-        handleSearchDestination(suggestion.name);
+        setSearchError(null);
+        showDestination(suggestion);
     };
 
     /**
@@ -519,11 +474,12 @@ export const SafetyMapScreen = ({ route }) => {
     // Initial check/request on mount
     useEffect(() => {
         requestLocationPermission();
-
+        // One GPS watch for the whole app (utils/locationWatcher.js): the map only listens to it.
+        const off = locationBus.subscribe(handleNewLocationFix);
         return () => {
-            if (locationSubscription.current) {
-                locationSubscription.current.remove();
-            }
+            off();
+            if (cameraTimerRef.current) clearTimeout(cameraTimerRef.current);
+            if (autocompleteTimerRef.current) clearTimeout(autocompleteTimerRef.current);
         };
     }, []);
 
@@ -536,20 +492,27 @@ export const SafetyMapScreen = ({ route }) => {
         }
     }, [route?.params?.communityRequestId]);
 
-    // Periodic background refresh for danger zone data (every 30 seconds)
+    // Periodic background refresh of the risk cells where the map is looking (every 30 seconds)
     useEffect(() => {
-        if (permissionStatus === 'granted') {
-            loadDangerZones();
-        }
-
         const autoRefreshInterval = setInterval(() => {
-            if (permissionStatus === 'granted') {
-                loadDangerZones(null, true);
-            }
+            loadDangerZones(null, true);
         }, 30000);
 
         return () => clearInterval(autoRefreshInterval);
-    }, [permissionStatus, userLocation?.latitude, userLocation?.longitude]);
+    }, []);
+
+    // The camera stopped: load the cells there, unless it only moved a little at the same zoom.
+    const handleRegionChangeComplete = (region) => {
+        setMapRegion(region);
+        cameraRef.current = region;
+        if (cameraTimerRef.current) clearTimeout(cameraTimerRef.current);
+        cameraTimerRef.current = setTimeout(() => {
+            const last = lastCellCenter.current;
+            const radius = cellRadiusFor(region);
+            const moved = last ? calculateDistanceMeters(last.latitude, last.longitude, region.latitude, region.longitude) : Infinity;
+            if (moved > CAMERA_RELOAD_DISTANCE_M || !last || radius > last.radius) loadDangerZones(null, true);
+        }, CAMERA_RELOAD_DELAY_MS);
+    };
 
     const requestLocationPermission = async () => {
         try {
@@ -591,20 +554,27 @@ export const SafetyMapScreen = ({ route }) => {
     };
 
     /**
-     * Start continuous live GPS position watching
+     * Start following the shared GPS watch. Without a first fix the map stays usable, centred on the default region.
      */
     const startLiveTracking = async () => {
-        ensureWatching();
         setIsLoadingLocation(true);
+        setErrorMessage(null);
         try {
-            // Get initial location snapshot
-            const location = await Location.getCurrentPositionAsync({
-                accuracy: Location.Accuracy.Balanced,
-            });
+            await ensureWatching();
+            setTrackingActive(true);
+
+            const location = locationBus.getLast()
+                ? { coords: locationBus.getLast(), timestamp: locationBus.getLast().timestamp }
+                : await getBestPosition();
+
+            if (!location) {
+                setErrorMessage('Waiting for a GPS signal. The map keeps working in the meantime.');
+                loadDangerZones(DEFAULT_REGION, true);
+                return;
+            }
 
             handleNewLocationFix(location);
 
-            // Center initial map camera
             const initialCoords = {
                 latitude: location.coords.latitude,
                 longitude: location.coords.longitude,
@@ -615,30 +585,15 @@ export const SafetyMapScreen = ({ route }) => {
                 longitudeDelta: 0.02,
             };
             setMapRegion(newRegion);
+            cameraRef.current = newRegion;
             mapRef.current?.animateToRegion(newRegion, 1000);
 
-            // Subscribe to continuous live location updates
-            if (locationSubscription.current) {
-                locationSubscription.current.remove();
-            }
-
-            locationSubscription.current = await Location.watchPositionAsync(
-                {
-                    accuracy: Location.Accuracy.Balanced,
-                    timeInterval: 5000, // update every 5 seconds
-                    distanceInterval: 10, // update every 10 meters
-                },
-                (loc) => handleNewLocationFix(loc)
-            );
-
-            setTrackingActive(true);
-            setPermissionStatus('granted');
             fetchCurrentLocationRiskData(initialCoords.latitude, initialCoords.longitude);
-            loadDangerZones(initialCoords);
+            loadDangerZones(newRegion);
             loadCommunityIncidents(initialCoords);
         } catch (error) {
             console.error('Error starting live tracking:', error);
-            setErrorMessage('Could not establish continuous live tracking. Retrying...');
+            setErrorMessage('Could not start live tracking. Tap the location button to try again.');
         } finally {
             setIsLoadingLocation(false);
         }
@@ -647,7 +602,9 @@ export const SafetyMapScreen = ({ route }) => {
     /**
      * Handle incoming GPS location fixes smoothly
      */
-    const handleNewLocationFix = (location) => {
+    const handleNewLocationFix = (fix) => {
+        // Accepts both shapes: a raw expo-location result, and the flat object the locationBus publishes.
+        const location = fix?.coords ? fix : fix ? { coords: fix, timestamp: fix.timestamp } : null;
         if (!location || !location.coords) return;
 
         const coords = {
@@ -682,22 +639,24 @@ export const SafetyMapScreen = ({ route }) => {
         }
     };
 
-    const loadDangerZones = async (coords = null, isSilent = false) => {
+    // `target` is any { latitude, longitude, latitudeDelta? }; without one, the cells follow the camera.
+    const loadDangerZones = async (target = null, isSilent = false) => {
+        const area = target || cameraRef.current;
+        const lat = area?.latitude;
+        const lng = area?.longitude;
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+
         if (!isSilent) setIsLoadingDangerZones(true);
         setDangerZoneError(null);
 
-        const lat = coords ? coords.latitude : userLocation?.latitude;
-        const lng = coords ? coords.longitude : userLocation?.longitude;
+        const radius = cellRadiusFor(area);
+        lastCellCenter.current = { latitude: lat, longitude: lng, radius };
 
-        if (!lat || !lng) {
-            if (!isSilent) setIsLoadingDangerZones(false);
-            return;
-        }
-
-        const res = await riskService.getCellsAround(lat, lng, 3000, 'LOW');
+        // SAFE cells are drawn too: the legend shows them, and green tells the user the area was actually checked.
+        const res = await riskService.getCellsAround(lat, lng, radius, 'SAFE');
         if (res.success) {
-            const cells = res.data || [];
-            setDangerZones(cells);
+            setDangerZones(res.data || []);
+            setCellCoverage({ scanned: res.meta?.scanned ?? null, unknownCells: res.meta?.unknownCells ?? 0 });
             setRiskMeta(res.meta?.source === 'device' ? { source: 'device', fetchedAt: res.meta.fetchedAt } : { source: 'server', fetchedAt: Date.now() });
         } else {
             setDangerZoneError(res.error?.message || 'Failed to load risk cells');
@@ -719,6 +678,7 @@ export const SafetyMapScreen = ({ route }) => {
                 longitudeDelta: 0.015,
             };
             mapRef.current?.animateToRegion(targetRegion, 1000);
+            cameraRef.current = targetRegion;
         } else {
             await startLiveTracking();
         }
@@ -733,7 +693,7 @@ export const SafetyMapScreen = ({ route }) => {
     useEffect(() => {
         if (offlineRef.current === conn.isOffline) return;
         offlineRef.current = conn.isOffline;
-        if (userLocation) loadDangerZones(null, true);
+        loadDangerZones(null, true);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [conn.isOffline]);
 
@@ -741,28 +701,26 @@ export const SafetyMapScreen = ({ route }) => {
         setMapType(prev => prev === 'standard' ? 'hybrid' : 'standard');
     };
 
-    const handleSelectZone = (zone) => {
+    const handleSelectZone = async (zone) => {
         setSelectedZone(zone);
+        setSelectedZoneRisk(null);
+        setShowDestinationPanel(false);
+        setShowCurrentRiskPanel(true);
         setBottomSheetExpanded(true);
 
-        let latitude = null;
-        let longitude = null;
-        if (zone.location && Array.isArray(zone.location.coordinates)) {
-            longitude = zone.location.coordinates[0];
-            latitude = zone.location.coordinates[1];
-        } else if (zone.latitude && zone.longitude) {
-            latitude = Number(zone.latitude);
-            longitude = Number(zone.longitude);
+        // The list only carries the summary; the factors shown in the panel come from the full cell result.
+        if (zone.h3Index) {
+            setIsZoneRiskLoading(true);
+            const res = await riskService.getCell(zone.h3Index);
+            if (res.success && res.data) setSelectedZoneRisk(res.data);
+            setIsZoneRiskLoading(false);
         }
+    };
 
-        if (latitude && longitude && mapRef.current) {
-            mapRef.current.animateToRegion({
-                latitude,
-                longitude,
-                latitudeDelta: 0.015,
-                longitudeDelta: 0.015,
-            }, 800);
-        }
+    const clearSelectedZone = () => {
+        setSelectedZone(null);
+        setSelectedZoneRisk(null);
+        setShowCurrentRiskPanel(false);
     };
 
     // The search box is for destinations, so it does not filter the map cells.
@@ -771,11 +729,6 @@ export const SafetyMapScreen = ({ route }) => {
     const insideCell = geofenceResult?.insideDangerZone ? dangerZones.find((z) => z.h3Index === geofenceResult.h3Index) : null;
     const activeZone = selectedZone || insideCell || null;
     const activeRiskColors = getRiskColors(activeZone?.riskLevel);
-    const locationChatName = 'Your current location';
-    // Keep the UI data shaped as location groups so real chat messages can be
-    // connected later without adding a new API or changing this layout.
-    const locationChatGroups = [{ location: locationChatName, preview: 'Local chat will appear here when community chat data is available.' }];
-
     // Backend risk result -> what the panels render. score is null when the level is UNKNOWN.
     const buildRiskInfo = (data) => {
         if (!data) return null;
@@ -785,6 +738,9 @@ export const SafetyMapScreen = ({ route }) => {
     };
     const destinationRiskInfo = buildRiskInfo(destinationRiskData);
     const currentLocationRiskInfo = buildRiskInfo(currentLocationRiskData);
+    // What the risk panel shows: the tapped cell when there is one, otherwise where the user is.
+    const panelRiskData = selectedZone ? (selectedZoneRisk || selectedZone) : currentLocationRiskData;
+    const panelRiskInfo = buildRiskInfo(panelRiskData);
 
     return (
         <Screen style={styles.container} isSafe={false}>
@@ -792,12 +748,13 @@ export const SafetyMapScreen = ({ route }) => {
             <MapComponent 
                 ref={mapRef}
                 region={mapRegion}
-                onRegionChangeComplete={(region) => setMapRegion(region)}
+                onRegionChangeComplete={handleRegionChangeComplete}
                 userLocation={userLocation}
                 destinationMarker={destination}
                 onSelectDestination={handleOpenDestinationDetails}
-                // Offline on Android (Google Maps) draw no base tiles at all instead of a half-loaded grid.
-                mapType={conn.isOffline && Platform.OS === 'android' ? 'none' : mapType}
+                mapType={mapType}
+                bottomInset={MAP_BOTTOM_INSET}
+                onTilesStatus={(status) => setTilesFailed(status === 'failed')}
                 dangerZones={filteredDangerZones}
                 communityIncidents={communityIncidents}
                 selectedZone={activeZone}
@@ -822,13 +779,13 @@ export const SafetyMapScreen = ({ route }) => {
                         {riskMeta?.source === 'device' && dangerZones.length
                             ? `cached risk cells, updated ${formatAge(Date.now() - riskMeta.fetchedAt) || 'just now'}`
                             : dangerZones.length ? 'showing last loaded cells' : 'no cached risk data here; download this area in Settings'}
-                        {Platform.OS === 'android' && conn.isOffline ? ' · base map blank' : ''}
+                        {tilesFailed ? ' · base map not available' : ''}
                     </Text>
                 </View>
             )}
 
             {/* Nearby services: type toggles + data-quality line */}
-            <View style={styles.nearbyToggles} pointerEvents="box-none">
+            <View style={[styles.nearbyToggles, destination && !showDestinationPanel && { top: 206 }]} pointerEvents="box-none">
                 <View style={styles.nearbyToggleRow}>
                     {NEARBY_TYPES.map((t) => {
                         const on = visibleTypes.has(t.key);
@@ -848,6 +805,16 @@ export const SafetyMapScreen = ({ route }) => {
                 {nearby && nearbyStatusText(nearby) ? (
                     <View style={styles.nearbyNote}>
                         <Text variant="labelSm" color={colors['on-surface-variant']}>{nearbyStatusText(nearby)}</Text>
+                    </View>
+                ) : null}
+                {/* Why no hexagons are showing: an empty map must not read as "all clear" */}
+                {!dangerZones.length && !isLoadingDangerZones && cellCoverage && riskMeta?.source !== 'device' ? (
+                    <View style={styles.nearbyNote}>
+                        <Text variant="labelSm" color={colors.error}>
+                            {cellCoverage.scanned === 0
+                                ? 'No risk data here: SafeTours covers Mumbai. Search a Mumbai place to see cells.'
+                                : 'Not enough data to rate this area yet.'}
+                        </Text>
                     </View>
                 ) : null}
             </View>
@@ -873,7 +840,7 @@ export const SafetyMapScreen = ({ route }) => {
                                 setShowDestinationPanel(false);
                             }}
                             onBlur={() => setIsSearchFocused(false)}
-                            onSubmitEditing={() => handleSearchDestination()}
+                            onSubmitEditing={handleSearchDestination}
                             returnKeyType="search"
                             blurOnSubmit={false}
                         />
@@ -884,7 +851,7 @@ export const SafetyMapScreen = ({ route }) => {
                                 <Ionicons name="close-circle" size={20} color={colors.outline} />
                             </TouchableOpacity>
                         ) : (
-                            <TouchableOpacity style={styles.micButton} onPress={() => handleSearchDestination()}>
+                            <TouchableOpacity style={styles.micButton} onPress={handleSearchDestination}>
                                 <Ionicons name="arrow-forward-circle" size={22} color={colors.primary} />
                             </TouchableOpacity>
                         )}
@@ -1037,7 +1004,7 @@ export const SafetyMapScreen = ({ route }) => {
             </TouchableOpacity>
 
             {/* Location Permission Fallback Overlay */}
-            {permissionStatus !== 'granted' && (
+            {permissionStatus !== 'granted' && !browseWithoutLocation && (
                 <View style={styles.permissionOverlay}>
                     <View style={styles.permissionCard}>
                         <View style={styles.permissionIconContainer}>
@@ -1073,6 +1040,19 @@ export const SafetyMapScreen = ({ route }) => {
                             >
                                 <Text variant="labelLg" color={colors['on-primary']} style={{ fontWeight: 'bold' }}>
                                     {permissionStatus === 'permanently_denied' ? "Open Settings" : "Grant Permission"}
+                                </Text>
+                            </TouchableOpacity>
+                        )}
+                        {permissionStatus !== 'checking' && (
+                            <TouchableOpacity
+                                style={{ marginTop: spacing.md, padding: spacing.xs }}
+                                onPress={() => {
+                                    setBrowseWithoutLocation(true);
+                                    loadDangerZones(DEFAULT_REGION, true);
+                                }}
+                            >
+                                <Text variant="labelLg" color={colors.primary} style={{ fontWeight: 'bold' }}>
+                                    Browse the map without my location
                                 </Text>
                             </TouchableOpacity>
                         )}
@@ -1213,7 +1193,7 @@ export const SafetyMapScreen = ({ route }) => {
                             <View style={[styles.actionButtonsRow, { marginTop: spacing.sm }]}>
                                 <TouchableOpacity 
                                     style={styles.routeBtn} 
-                                    onPress={() => navigation.navigate('LiveJourney', { destination })}
+                                    onPress={() => navigation.navigate('LiveJourney', { destination, requestId: Date.now() })}
                                 >
                                     <Ionicons name="navigate-circle-outline" size={20} color={colors['on-primary']} />
                                     <Text variant="labelLg" color={colors['on-primary']} style={{ fontWeight: 'bold' }}>
@@ -1265,6 +1245,11 @@ export const SafetyMapScreen = ({ route }) => {
                             </TouchableOpacity>
                         )}
 
+                        {/* The position is only known after the first fix */}
+                        {errorMessage && !userLocation && (
+                            <Text variant="labelMd" color={colors['on-surface-variant']} style={{ marginBottom: spacing.xs }}>{errorMessage}</Text>
+                        )}
+
                         {/* Loading state while fetching */}
                         {isCurrentRiskLoading && (
                             <View style={styles.loadingContainer}>
@@ -1287,12 +1272,12 @@ export const SafetyMapScreen = ({ route }) => {
                         )}
 
                         {/* Risk detail panel — shown only when user taps the button */}
-                        {showCurrentRiskPanel && !isCurrentRiskLoading && (currentLocationRiskInfo || activeZone) && (
+                        {showCurrentRiskPanel && !isCurrentRiskLoading && (panelRiskInfo || activeZone) && (
                             <>
                                 {(() => {
-                                    const activeColors = currentLocationRiskInfo ? currentLocationRiskInfo.colors : activeRiskColors;
-                                    const displayScore = currentLocationRiskInfo ? currentLocationRiskInfo.score : activeZone?.totalRiskScore;
-                                    const displayLevel = currentLocationRiskInfo ? currentLocationRiskInfo.label : (activeZone?.riskLevel || activeRiskColors.label);
+                                    const activeColors = panelRiskInfo ? panelRiskInfo.colors : activeRiskColors;
+                                    const displayScore = panelRiskInfo ? panelRiskInfo.score : activeZone?.totalRiskScore;
+                                    const displayLevel = panelRiskInfo ? panelRiskInfo.label : (activeZone?.riskLevel || activeRiskColors.label);
 
                                     return (
                                         <>
@@ -1317,7 +1302,7 @@ export const SafetyMapScreen = ({ route }) => {
                                                         </Text>
                                                     </View>
                                                     <TouchableOpacity
-                                                        onPress={() => setShowCurrentRiskPanel(false)}
+                                                        onPress={clearSelectedZone}
                                                         style={{ padding: 4 }}
                                                     >
                                                         <Ionicons name="chevron-down" size={20} color={colors['on-surface-variant']} />
@@ -1345,8 +1330,8 @@ export const SafetyMapScreen = ({ route }) => {
                                                     <View>
                                                         <Text variant="labelMd" color={colors['on-surface-variant']}>Data Confidence</Text>
                                                         <Text variant="headlineSm" style={{ fontWeight: 'bold', color: colors.primary }}>
-                                                            {currentLocationRiskData?.dataConfidence != null
-                                                                ? `${Math.round(currentLocationRiskData.dataConfidence * 100)}%`
+                                                            {panelRiskData?.dataConfidence != null
+                                                                ? `${Math.round(panelRiskData.dataConfidence * 100)}%`
                                                                 : 'N/A'}
                                                         </Text>
                                                     </View>
@@ -1354,14 +1339,16 @@ export const SafetyMapScreen = ({ route }) => {
                                             </View>
 
                                             {/* Contributing factors (backend risk engine) */}
-                                            {currentLocationRiskInfo && (
+                                            {isZoneRiskLoading ? (
+                                                <ActivityIndicator size="small" color={colors.primary} style={{ marginTop: spacing.sm }} />
+                                            ) : panelRiskInfo?.risk?.breakdown ? (
                                                 <>
                                                     <Text variant="labelLg" style={{ fontWeight: 'bold', marginTop: spacing.xs, marginBottom: spacing.xs, color: colors['on-surface'] }}>
                                                         Contributing Factors
                                                     </Text>
-                                                    <FactorChips risk={currentLocationRiskInfo.risk} />
+                                                    <FactorChips risk={panelRiskInfo.risk} />
                                                 </>
-                                            )}
+                                            ) : null}
 
                                         </>
                                     );
@@ -1374,10 +1361,10 @@ export const SafetyMapScreen = ({ route }) => {
                 <View style={[styles.actionButtonsRow, { marginTop: spacing.md }]}>
                     <TouchableOpacity style={styles.routeBtn} onPress={() => navigation.navigate('LiveJourney')}>
                         <Ionicons name="navigate" size={20} color={colors['on-primary']} />
-                        <Text variant="labelLg" color={colors['on-primary']}>Route Home</Text>
+                        <Text variant="labelLg" color={colors['on-primary']}>Start Journey</Text>
                     </TouchableOpacity>
 
-                    <TouchableOpacity style={styles.shareBtn}>
+                    <TouchableOpacity style={styles.shareBtn} onPress={() => shareLocation(userLocation)}>
                         <Ionicons name="share-social" size={20} color={colors.primary} />
                         <Text variant="labelLg" color={colors.primary}>Share Location</Text>
                     </TouchableOpacity>
@@ -1447,7 +1434,7 @@ export const SafetyMapScreen = ({ route }) => {
             />
 
             {/* Report Community Incident Modal */}
-            <Modal visible={showReportModal} transparent animationType="slide">
+            <Modal visible={showReportModal} transparent animationType="slide" onRequestClose={() => setShowReportModal(false)}>
                 <View style={styles.permissionOverlay}>
                     <View style={styles.permissionCard}>
                         <View style={styles.sheetHeader}>
@@ -1512,7 +1499,7 @@ export const SafetyMapScreen = ({ route }) => {
             </Modal>
 
             {/* Community Incidents Feed Modal */}
-            <Modal visible={showCommunityFeed} transparent animationType="slide">
+            <Modal visible={showCommunityFeed} transparent animationType="slide" onRequestClose={() => setShowCommunityFeed(false)}>
                 <View style={styles.permissionOverlay}>
                     <View style={[styles.permissionCard, { maxHeight: '80%' }]}>
                         <View style={styles.sheetHeader}>
@@ -1524,17 +1511,6 @@ export const SafetyMapScreen = ({ route }) => {
                             </TouchableOpacity>
                         </View>
 
-                        {/* Frontend-only placeholders: ready to receive real location chat data later. */}
-                        {locationChatGroups.map(group => (
-                            <View key={group.location} style={styles.locationChatCard}>
-                                <View style={styles.locationChatTitle}>
-                                    <Ionicons name="location" size={18} color={colors.primary} />
-                                    <Text variant="labelLg" style={{ color: colors.primary, fontWeight: 'bold' }}>Location Chat · {group.location}</Text>
-                                </View>
-                                <Text variant="bodyMd" color={colors['on-surface-variant']}>{group.preview}</Text>
-                            </View>
-                        ))}
-
                         {isLoadingCommunity ? (
                             <View style={styles.communityState}>
                                 <ActivityIndicator size="large" color={colors.primary} />
@@ -1542,7 +1518,7 @@ export const SafetyMapScreen = ({ route }) => {
                         ) : communityError ? (
                             <View style={styles.communityState}>
                                 <Text variant="bodyMd" color={colors.error} style={{ textAlign: 'center' }}>{communityError}</Text>
-                                <TouchableOpacity style={styles.communityRetryButton} onPress={loadCommunityIncidents}>
+                                <TouchableOpacity style={styles.communityRetryButton} onPress={() => loadCommunityIncidents()}>
                                     <Text variant="labelMd" color={colors.white}>Try Again</Text>
                                 </TouchableOpacity>
                             </View>
@@ -1973,20 +1949,7 @@ const styles = StyleSheet.create({
         borderWidth: 1,
         borderColor: 'rgba(217, 194, 183, 0.2)',
         width: '100%',
-    },
-    locationChatCard: {
-        width: '100%',
-        backgroundColor: colors['primary-container'],
-        borderRadius: shapes.roundedLg,
-        padding: spacing.md,
-        marginBottom: spacing.md,
-    },
-    locationChatTitle: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: spacing.sm,
-        marginBottom: spacing.xs,
-    },
+    },
     communityState: {
         alignItems: 'center',
         justifyContent: 'center',

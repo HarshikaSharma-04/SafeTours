@@ -38,6 +38,27 @@ export async function ensureWatching() {
   }
 }
 
+const FRESH_ENOUGH_MS = 2 * 60 * 1000;
+const GPS_WAIT_MS = 8000;
+
+/**
+ * The best position available without making the user wait: a recent known position straight away, otherwise a new
+ * fix for up to 8 s, otherwise whatever was last known. Indoors a new fix can take minutes or never arrive, so a screen
+ * must not wait on it. Null when there is no position at all. Never throws.
+ */
+export async function getBestPosition() {
+  const known = await Location.getLastKnownPositionAsync().catch(() => null);
+  if (known && Date.now() - known.timestamp < FRESH_ENOUGH_MS) return known;
+  try {
+    return await Promise.race([
+      Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('GPS timeout')), GPS_WAIT_MS)),
+    ]);
+  } catch (error) {
+    return known;
+  }
+}
+
 export function stopWatching() {
   subscription?.remove();
   subscription = null;

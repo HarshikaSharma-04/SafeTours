@@ -87,6 +87,17 @@ async function getCellRisk(h3Index, opts) {
   return publicView(h3Index, cell, result);
 }
 
+/** Evaluates many cells with one grid query and one feed lookup. Cells outside the grid come back UNKNOWN. */
+async function getCellsRisk(h3Indexes, { now = new Date() } = {}) {
+  const docs = await GridCell.find({ h3Index: { $in: h3Indexes } }).select('h3Index center components').lean();
+  const byIndex = new Map(docs.map((d) => [d.h3Index, d]));
+  const feeds = await loadFeeds();
+  return h3Indexes.map((h3Index) => {
+    const cell = byIndex.get(h3Index) || null;
+    return { h3Index, cell, result: evaluate({ components: (cell && cell.components) || {}, feeds, now }) };
+  });
+}
+
 async function getRiskAt(lat, lng, opts) {
   return getCellRisk(toCell(lat, lng), opts);
 }
@@ -218,6 +229,7 @@ module.exports = {
   toCell,
   evaluateCell,
   getCellRisk,
+  getCellsRisk,
   getRiskAt,
   listCellsInBox,
   setComponentScores,

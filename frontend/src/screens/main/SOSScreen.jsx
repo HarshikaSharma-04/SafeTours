@@ -14,7 +14,8 @@ import { useOutbox } from '../../context/OutboxContext';
 import { SosStatusCard } from '../../components/SosStatusCard';
 import { Toast } from '../../components/Toast';
 import { NearestHelpStrip } from '../../components/NearestHelpStrip';
-import { ensureWatching } from '../../utils/locationWatcher';
+import { ensureWatching, getBestPosition } from '../../utils/locationWatcher';
+import { shareLocation } from '../../utils/shareLocation';
 
 export const SOSScreen = () => {
     const navigation = useNavigation();
@@ -61,11 +62,18 @@ export const SOSScreen = () => {
         loadActiveSOS();
         loadJourney();
 
-        // A navigation SOS request is sent immediately, so Home does not require a second tap.
-        if (route.params?.triggerSOS) {
+    }, []);
+
+    // A navigation SOS request is sent immediately, so Home does not require a second tap. The id is new on every
+    // press: this screen stays mounted between visits, so a plain flag would only ever fire the first time.
+    const handledTrigger = useRef(null);
+    useEffect(() => {
+        const id = route.params?.triggerRequestId;
+        if (id && handledTrigger.current !== id) {
+            handledTrigger.current = id;
             handleSOSPress();
         }
-    }, []);
+    }, [route.params?.triggerRequestId]);
 
     // Restores the cancel controls after an app restart.
     const loadActiveSOS = async () => {
@@ -95,11 +103,13 @@ export const SOSScreen = () => {
         try {
             const { status } = await Location.requestForegroundPermissionsAsync();
             if (status === 'granted') {
-                const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
-                setUserLocation({
-                    latitude: loc.coords.latitude,
-                    longitude: loc.coords.longitude,
-                });
+                const loc = await getBestPosition();
+                if (loc) {
+                    setUserLocation({
+                        latitude: loc.coords.latitude,
+                        longitude: loc.coords.longitude,
+                    });
+                }
             }
         } catch (err) {
             console.warn('Could not fetch location for SOS:', err);
@@ -393,13 +403,13 @@ export const SOSScreen = () => {
             </ScrollView>
 
             {/* Share Sheet */}
-            <Modal visible={showShareSheet} transparent animationType="slide">
+            <Modal visible={showShareSheet} transparent animationType="slide" onRequestClose={() => setShowShareSheet(false)}>
                 <View style={styles.sheetOverlay}>
                     <View style={styles.sheetContent}>
                         <View style={styles.sheetHandle} />
                         <Text variant="headlineSm" style={{ fontWeight: 'bold', marginBottom: 4 }}>Share Live Location</Text>
                         <Text variant="bodyMd" color={colors['on-surface-variant']} style={{ marginBottom: 24 }}>
-                            Send your current status to your emergency contacts.
+                            Choose who receives your location in the next step.
                         </Text>
 
                         <View style={styles.innerCard}>
@@ -413,7 +423,13 @@ export const SOSScreen = () => {
                             </View>
                         </View>
 
-                        <TouchableOpacity style={styles.shareNowBtn} onPress={() => setShowShareSheet(false)}>
+                        <TouchableOpacity
+                            style={styles.shareNowBtn}
+                            onPress={() => {
+                                setShowShareSheet(false);
+                                shareLocation(userLocation, { prefix: hasSos ? 'SOS: I need help. My location' : 'My current location' });
+                            }}
+                        >
                             <Text variant="headlineSm" color={colors.white} style={{ fontWeight: 'bold' }}>SHARE NOW</Text>
                         </TouchableOpacity>
                         

@@ -21,6 +21,7 @@ const assistantRoutes = require('./routes/assistant.routes');
 const riskRoutes = require('./routes/risk.routes');
 const adminRoutes = require('./routes/admin.routes');
 const nearbyRoutes = require('./routes/nearby.routes');
+const placesRoutes = require('./routes/places.routes');
 const metaRoutes = require('./routes/meta.routes');
 const { verifyJWT } = require('./middleware/authMiddleware');
 
@@ -108,6 +109,7 @@ app.use('/api/crowd', verifyJWT, crowdRoutes);
 app.use('/api/risk', riskRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/nearby', nearbyRoutes);
+app.use('/api/places', placesRoutes);
 app.use('/api/community', communityRoutes);
 app.use('/api/geofence', geofenceRoutes);
 app.use('/api/assistant', assistantRoutes);

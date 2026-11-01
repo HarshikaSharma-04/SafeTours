@@ -60,7 +60,7 @@ Stand at the demo location (or use the destination search on the Map tab if GPS 
 ### 3. Offline and SOS (2:30 to 4:00)
 
 1. Settings (tab or menu) → switch **Offline Mode** on. Go back to Home: the chip turns **OFFLINE** and the card says "Offline check · Risk data updated X ago".
-2. **Map tab:** cells and nearby pins are still there (the base map is blank: say that it cannot download base tiles).
+2. **Map tab:** cells and nearby pins are still there. The base map shows only tiles this phone has already loaded: say that tiles cannot be downloaded in advance.
 3. **SOS tab → press the SOS button.** Show the status card, three separate facts: **Queued on this phone / SMS sent n/N / Delivered to server**. The red "SOS pending" banner appears on every screen.
 4. Phone B receives the text with a map link and the time in IST. Show it.
 5. Turn Offline Mode **off** on phone A. Within about 30 seconds the card changes to **Delivered to the server** and the banner goes away.
@@ -105,7 +105,7 @@ Stand at the demo location (or use the destination search on the Map tab if GPS 
 - **Risk score:** a weighted decision aid from five signals; the weights are design choices, not validated predictions.
 - **SMS:** Android sends directly after the user allows it and reports what the radio confirmed. iPhone always needs a tap on Send. With no cell service a text cannot be forced out; the SOS is saved and retried.
 - **Play Store:** the SMS-sending permission is restricted by Google; this build is for sideloading or internal testing.
-- **Offline maps:** risk cells and nearby places are available offline, the base map is not.
+- **Offline maps:** risk cells and nearby places are available offline. The base map (OpenStreetMap) shows only tiles already seen on this phone.
 - **Assistant:** answers only from your live app data, says when data is missing or sample, cannot file anything without your tap, and falls back to rules when the AI is unavailable.
 
 ---

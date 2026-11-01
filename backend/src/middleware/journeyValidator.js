@@ -43,6 +43,12 @@ const validateStartJourney = [
       }
       return true;
     }),
+
+  body('destinationName')
+    .optional({ nullable: true })
+    .isString().withMessage('destinationName must be text.')
+    .trim()
+    .isLength({ max: 200 }).withMessage('destinationName must be at most 200 characters.'),
 ];
 
 // Validation rules for updating a journey's status (e.g., finishing or cancelling a trip)
