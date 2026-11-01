@@ -71,7 +71,7 @@ function riskSentence(ctx) {
   if (r.topFactor && FACTOR_LABEL[r.topFactor]) parts[0] += `, mainly because of ${FACTOR_LABEL[r.topFactor]}`;
   parts[0] += '.';
   const caveats = [];
-  if (r.demo) caveats.push('part of this data is sample (demo) data');
+  if (r.demo) caveats.push('part of this data is sample data');
   if (r.lowConfidence || (Number.isFinite(r.dataConfidence) && r.dataConfidence < 0.6)) caveats.push('data confidence is low');
   if (r.missing && r.missing.length) caveats.push(`no data for ${r.missing.map((k) => FACTOR_LABEL[k] || k).join(', ')}`);
   if (r.stale && r.stale.length) caveats.push(`${r.stale.map((k) => FACTOR_LABEL[k] || k).join(', ')} may be out of date`);

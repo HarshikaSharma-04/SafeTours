@@ -6,9 +6,9 @@ import { connectivityStore } from '../connectivity/connectivityStore';
 import { contactsCache } from './contactsCache';
 import { profileService } from './profile';
 import { apiClient } from './apiClient';
-import { smsEnvironment, sendDirect, openComposer } from './smsSender';
+import { smsEnvironment, sendDirect, openComposer, requestSmsPermission } from './smsSender';
 import { locationBus } from '../utils/locationBus';
-import { planSms, reduceDirect, reduceComposer, reduceNone, shouldRetrySms, contactsToRetry } from '../offline/smsLogic';
+import { planSms, emptySms, reduceDirect, reduceComposer, reduceNone, shouldRetrySms, contactsToRetry, uniqueContacts, findReusableSos, singleFlight } from '../offline/smsLogic';
 import { buildSosSms, buildSafeSms } from '../offline/sosMessage';
 import { planCancel } from '../offline/outboxLogic';
 import { outbox as outboxCfg, sms as smsCfg } from '../offline/offlineConfig';
@@ -18,12 +18,14 @@ import { outbox as outboxCfg, sms as smsCfg } from '../offline/offlineConfig';
  *
  * 1. The SOS is written to the outbox FIRST (so it survives a crash, a kill, a dead network), under an
  *    idempotency key that never changes.
- * 2. Online: it is uploaded right away (the server texts the contacts if it has Twilio configured).
- *    Offline, or if the upload does not finish within a few seconds: the phone texts the contacts itself
- *    (direct SMS on Android with permission, the prefilled composer otherwise) and records the result on the row.
- * 3. Whatever is not delivered stays in the outbox and is uploaded when the connection returns; the upload carries
- *    the SMS report so the server does not text the same contacts again.
- * 4. A FAILED text (no signal / no service) is retried on a short timer for sms.retryWindowMs.
+ * 2. The phone texts the contacts itself, with or without internet (direct SMS on Android with permission, the
+ *    prefilled composer otherwise), and records the result on the row. SEND_SMS is asked for once, on the first SOS,
+ *    if nothing asked before; the retry timer never asks.
+ * 3. Online: it is uploaded once the texts went out, or after outbox.smsFirstWaitMs if they are slow. Whatever is not
+ *    delivered stays in the outbox and is uploaded when the connection returns; the upload carries the SMS report so
+ *    the server (Twilio, if configured) does not text the same contacts again.
+ * 4. A FAILED text (no signal / no service), or one never attempted because the app was killed, is retried on a timer
+ *    for sms.retryWindowMs. The timer only runs while the app's JS is alive.
  *
  * The UI reads the row (offline/smsLogic.sosView) and shows three separate facts: queued on the phone, SMS sent,
  * delivered to the server. It never says "sent" when only the local queue succeeded.
@@ -31,7 +33,9 @@ import { outbox as outboxCfg, sms as smsCfg } from '../offline/offlineConfig';
 const HOLD_TYPES = ['sos'];
 const volatile = new Map(); // SOS rows that could not be stored (SQLite unavailable): the text still goes out
 const attempting = new Set();
+const creatingKeys = new Set(); // rows createSos is still working on: the retry timer leaves them alone
 const listeners = new Set();
+let askingPermission = null; // the SEND_SMS dialog, while it is open
 let lastCancelled = null;
 let retryTimer = null;
 let started = false;
@@ -43,6 +47,7 @@ const read = async (h) => (h.volatile ? volatile.get(h.key) : outboxStore.get(h.
 async function patch(h, fields) {
   if (h.volatile) {
     const row = volatile.get(h.key);
+    if (!row) return null; // cancelled in the meantime
     volatile.set(h.key, { ...row, payload: { ...row.payload, ...fields } });
     return volatile.get(h.key);
   }
@@ -68,6 +73,13 @@ async function bestLocation() {
 }
 const toPayload = (l) => ({ latitude: l.latitude, longitude: l.longitude, accuracy: l.accuracy ?? undefined, timestamp: new Date(l.timestamp || Date.now()).toISOString() });
 
+/** The newest position held right now, without waiting: a GPS update newer than `saved` wins. Null when there is none. */
+function latestLocation(saved) {
+  const last = locationBus.getLast();
+  if (!last) return saved || null;
+  return saved && saved.timestamp && Date.parse(saved.timestamp) >= last.timestamp ? saved : toPayload(last);
+}
+
 // ── SMS ──────────────────────────────────────────────────────────────────────────────────────────
 async function smsContext() {
   let cached = await contactsCache.get();
@@ -84,38 +96,49 @@ async function smsContext() {
       /* offline: no name */
     }
   }
-  return { contacts: ((cached && cached.contacts) || []).filter((c) => c.phone), name: profile && profile.name, customText: profile && profile.customSosMessage };
+  return { contacts: uniqueContacts(((cached && cached.contacts) || []).filter((c) => c.phone)), name: profile && profile.name, customText: profile && profile.customSosMessage };
 }
 
 /**
  * One text-message attempt for an SOS row (all contacts the phone has not texted yet).
  * Without `force` it does nothing when the row already has a final answer: 'sent' (everyone texted),
  * 'composer_opened' (never re-open the composer by itself) or 'no_permission' (needs the user).
+ * `background` (timer, late upload): nobody just pressed anything, so the composer is not opened.
  */
-async function attemptSms(handle, { force = false } = {}) {
+async function attemptSms(handle, { force = false, background = false } = {}) {
   const key = handle.key;
   if (attempting.has(key)) return null;
   attempting.add(key);
   try {
     const row = await read(handle);
-    if (!row) return null;
+    if (!row || row.payload.cancelled || row.payload.cancelRequested) return null;
     const prev = row.payload.sms || null;
     if (!force && prev && ['sent', 'composer_opened', 'no_permission'].includes(prev.outcome)) return prev;
     const ctx = await smsContext();
     const targets = contactsToRetry(prev, ctx.contacts);
+    if (prev && targets.length === 0 && (prev.sentTo || []).length > 0) return prev; // everyone already has it
     const env = await smsEnvironment();
     const plan = planSms({ ...env, contactCount: targets.length });
-    const loc = row.payload.location || {};
-    const built = buildSosSms({ name: ctx.name, lat: loc.latitude, lng: loc.longitude, accuracy: loc.accuracy, triggeredAt: row.createdAt, customText: ctx.customText, maxSegments: smsCfg.maxSegments });
+    if (background && plan.strategy === 'composer') return prev;
+    const loc = latestLocation(row.payload.location) || {};
+    const built = buildSosSms({ name: ctx.name, lat: loc.latitude, lng: loc.longitude, accuracy: loc.accuracy, fixAt: loc.timestamp, staleFixMs: smsCfg.staleFixMs, triggeredAt: row.createdAt, customText: ctx.customText, maxSegments: smsCfg.maxSegments });
     const phones = targets.map((c) => c.phone);
     const now = Date.now();
+    const report = (state) => ({ ...state, total: Math.max(state.total || 0, ctx.contacts.length), message: { text: built.text, segments: built.segments, encoding: built.encoding, cut: built.cut } });
 
     let next;
-    if (plan.strategy === 'direct') next = reduceDirect(prev, await sendDirect(phones, built.text), now);
-    else if (plan.strategy === 'composer') next = reduceComposer(prev, await openComposerSafe(phones, built.text), phones, now, plan.reason);
+    if (plan.strategy === 'direct') {
+      // `base` knows the real total, so a report saved half way reads 'partial', never 'sent'.
+      const base = prev || emptySms(ctx.contacts.length);
+      const results = await sendDirect(phones, built.text, async (soFar) => {
+        await patch(handle, { sms: report(reduceDirect(base, soFar, now)) });
+        emit();
+      });
+      next = reduceDirect(base, results, now);
+    } else if (plan.strategy === 'composer') next = reduceComposer(prev, await openComposerSafe(phones, built.text), phones, now, plan.reason);
     else next = reduceNone(prev, plan.reason, now, ctx.contacts.length);
 
-    next = { ...next, total: Math.max(next.total || 0, ctx.contacts.length), message: { text: built.text, segments: built.segments, encoding: built.encoding, cut: built.cut } };
+    next = report(next);
     await patch(handle, { sms: next, holdUntil: null });
     emit();
     outboxRunner.kick(0); // the report is complete: let the upload go
@@ -123,6 +146,28 @@ async function attemptSms(handle, { force = false } = {}) {
   } finally {
     attempting.delete(key);
   }
+}
+
+/**
+ * The attempt that follows a press. Only here is SEND_SMS asked for, and only if it never was. An unanswered dialog
+ * does not hold the SOS up: its answer sends the text whenever it comes (and nothing opens over the dialog meanwhile).
+ */
+async function smsAfterPress(handle) {
+  const env = await smsEnvironment();
+  if (env.directAvailable && env.permission === 'undetermined') {
+    if (askingPermission) return null;
+    askingPermission = requestSmsPermission();
+    const answer = await withTimeout(askingPermission, smsCfg.permissionWaitMs);
+    if (!answer) {
+      askingPermission.then(() => {
+        askingPermission = null;
+        return attemptSms(handle, { force: true });
+      }).catch(() => {});
+      return null;
+    }
+    askingPermission = null;
+  }
+  return attemptSms(handle);
 }
 
 async function openComposerSafe(phones, text) {
@@ -149,61 +194,67 @@ async function waitSettled(handle, ms) {
  * @param {{source?:string, reason?:string, journeyId?:string, location?:Object}} p
  * @returns {Promise<{handle:Object, queued:boolean, storage:boolean}>}
  */
-export async function triggerSos(args = {}) {
-  // A double tap, or the volume buttons plus the screen button, must not make two SOS: while one is being
-  // created or is still waiting to be delivered (and is younger than 10 minutes) it is reused.
-  if (creating) return creating;
-  const existing = (await getSosRows()).find(
-    (r) => ['pending', 'sending', 'failed'].includes(r.status) && !(r.payload && (r.payload.cancelled || r.payload.cancelRequested)) && Date.now() - r.createdAt < 10 * 60 * 1000
-  );
+export const triggerSos = singleFlight(async (args = {}) => {
+  // A double tap, or the volume buttons plus the screen button, must not make two SOS. singleFlight covers presses
+  // while one is being created; after that, a recent SOS that was not cancelled is reused, and only contacts not
+  // texted yet can get a text from it.
+  const existing = findReusableSos(await getSosRows(), Date.now());
   if (existing) {
+    const handle = { key: existing.idempotencyKey, id: existing.id, volatile: !existing.id };
     emit();
-    return { handle: { key: existing.idempotencyKey, id: existing.id, volatile: !existing.id }, queued: true, storage: Boolean(existing.id), reused: true };
+    if (existing.payload.deviceSms !== false) smsAfterPress(handle).catch(() => {});
+    return { handle, queued: true, storage: Boolean(existing.id), reused: true };
   }
-  creating = createSos(args).finally(() => {
-    creating = null;
-  });
-  return creating;
-}
-
-let creating = null;
+  return createSos(args);
+});
 
 async function createSos({ source = 'manual', reason = 'Manual SOS', journeyId, location } = {}) {
   const createdAt = Date.now();
   const key = newIdempotencyKey();
-  const loc = location || (await bestLocation());
-  const payload = { source, reason, journeyId: journeyId || undefined, location: loc || undefined, deviceSms: true, holdUntil: createdAt + outboxCfg.smsHoldMs };
+  const known = latestLocation(location);
+  const payload = { source, reason, journeyId: journeyId || undefined, location: known || undefined, deviceSms: true, holdUntil: createdAt + outboxCfg.smsHoldMs };
 
-  // 1) the outbox, before anything else
-  const enq = await outboxStore.enqueue({ type: 'sos', payload, idempotencyKey: key, createdAt });
-  let handle;
-  if (enq.ok) handle = { key, id: enq.row.id };
-  else {
-    handle = { key, id: null, volatile: true };
-    volatile.set(key, { id: null, type: 'sos', status: 'pending', createdAt, payload, lastError: 'Could not be stored on this phone' });
-  }
-  emit();
-  await outboxRunner.refresh();
-
-  // 2) deliver
-  const offline = connectivityStore.getState().isOffline;
-  if (!offline && enq.ok) {
-    await patch(handle, { holdUntil: null });
-    await withTimeout(outboxRunner.drain({ onlyTypes: HOLD_TYPES }), outboxCfg.sosImmediateTimeoutMs);
-    const after = await waitSettled(handle, 3000); // another drain may have the request in flight
-    if (after && after.status === 'sent') {
-      const mode = after.payload.delivery && after.payload.delivery.contactsSms;
-      if (mode === 'twilio') await patch(handle, { deviceSms: false }); // the server texted the contacts
-      else await attemptSms(handle); // the server only logs: the phone texts them
-      emit();
-      return { handle, queued: false, storage: enq.ok };
+  // 1) the outbox, before anything else (and before waiting for GPS)
+  creatingKeys.add(key);
+  try {
+    const enq = await outboxStore.enqueue({ type: 'sos', payload, idempotencyKey: key, createdAt });
+    let handle;
+    if (enq.ok) handle = { key, id: enq.row.id };
+    else {
+      handle = { key, id: null, volatile: true };
+      volatile.set(key, { id: null, idempotencyKey: key, type: 'sos', status: 'pending', createdAt, payload, lastError: 'Could not be stored on this phone' });
     }
+    emit();
+    await outboxRunner.refresh();
+
+    // 2) a better position, if the one held is old or of unknown age (a few seconds at most)
+    if (!known || !known.timestamp || createdAt - Date.parse(known.timestamp) > 120000) {
+      const fresh = await bestLocation();
+      if (fresh) await patch(handle, { location: fresh });
+    }
+
+    // 3) text the contacts from this phone, with or without internet
+    await withTimeout(smsAfterPress(handle).catch(() => null), outboxCfg.smsFirstWaitMs);
+
+    // 4) upload (a text still in flight carries on; the outbox uploads the report with what it has)
+    if (!connectivityStore.getState().isOffline && enq.ok) {
+      await patch(handle, { holdUntil: null });
+      await withTimeout(outboxRunner.drain({ onlyTypes: HOLD_TYPES }), outboxCfg.sosImmediateTimeoutMs);
+      const after = await waitSettled(handle, 3000); // another drain may have the request in flight
+      if (after && after.status === 'sent') {
+        const mode = after.payload.delivery && after.payload.delivery.contactsSms;
+        if (mode === 'twilio') await patch(handle, { deviceSms: false }); // the server texts whoever the phone could not
+        emit();
+        return { handle, queued: false, storage: enq.ok };
+      }
+    }
+    // not delivered (offline, slow or failing server): the outbox uploads it later
+    outboxRunner.kick(500);
+    emit();
+    return { handle, queued: true, storage: enq.ok };
+  } finally {
+    creatingKeys.delete(key);
   }
-  // not delivered (offline, slow or failing server): text the contacts from this phone now, upload later
-  await attemptSms(handle);
-  outboxRunner.kick(500);
-  emit();
-  return { handle, queued: true, storage: enq.ok };
 }
 
 // ── cancel ───────────────────────────────────────────────────────────────────────────────────────
@@ -314,15 +365,16 @@ export const sosDispatcher = {
       const handle = { key: row.idempotencyKey, id: row.id };
       const mode = p && p.delivery && p.delivery.contactsSms;
       if (mode === 'twilio') await patch(handle, { deviceSms: false });
-      else if (row.payload.deviceSms !== false) await attemptSms(handle); // a late upload: the server will not text, the phone does
+      else if (row.payload.deviceSms !== false && !creatingKeys.has(row.idempotencyKey)) await attemptSms(handle, { background: true }); // a late upload: the server will not text, the phone does
       emit();
     });
     retryTimer = setInterval(async () => {
       try {
-        const rows = await outboxStore.list({ types: ['sos'], limit: 20 });
+        const rows = await getSosRows();
         for (const row of rows) {
+          if (creatingKeys.has(row.idempotencyKey)) continue;
           if (row.payload.deviceSms === false || row.payload.cancelled || row.payload.cancelRequested) continue;
-          if (shouldRetrySms(row.payload.sms, { now: Date.now(), triggeredAt: row.createdAt, cfg: smsCfg })) attemptSms({ key: row.idempotencyKey, id: row.id });
+          if (shouldRetrySms(row.payload.sms, { now: Date.now(), triggeredAt: row.createdAt, cfg: smsCfg })) attemptSms({ key: row.idempotencyKey, id: row.id, volatile: !row.id }, { background: true });
         }
       } catch (e) {
         /* storage unavailable */

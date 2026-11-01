@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Secrets (.env.example files stay in the repo)
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*.p8
+*.p12
+*.pem
+*.key
+credentials.json
+*service-account*.json
+*firebase-adminsdk*.json
+
+# Stray Expo project files at the repo root (the app lives in frontend/)
+/android/
+/ios/
+/app.json
+/package.json
+
+# Build output
+*.apk
+*.aab
+dist/
+web-build/
+.expo/
+
+# Logs
+*.log
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

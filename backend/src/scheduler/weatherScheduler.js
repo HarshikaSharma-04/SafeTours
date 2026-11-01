@@ -71,7 +71,8 @@ async function processWeatherUpdate() {
     const usable = observed.filter((s) => s.ok).map((s) => ({ lat: s.lat, lng: s.lng, score: s.scored.score, rain: s.scored.factors.rain ?? null }));
     if (usable.length === 0) throw new Error('all weather samples failed or were stale');
 
-    const cells = await GridCell.find({}).select('h3Index center').lean();
+    // A cell without a centre cannot be interpolated, and one such document must not cost the whole city its weather.
+    const cells = await GridCell.find({ 'center.lat': { $type: 'number' }, 'center.lng': { $type: 'number' } }).select('h3Index center').lean();
     const flood = loadFloodProne();
     const scores = {};
     let outOfRange = 0;

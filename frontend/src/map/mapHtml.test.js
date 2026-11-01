@@ -34,3 +34,22 @@ test('text from reports only reaches the page through textContent, never innerHT
   assert.match(script, /textContent/);
   assert.doesNotMatch(script, /innerHTML/);
 });
+
+test('no screen uses StyleSheet.absoluteFillObject: React Native removed it, so the map would silently have no size', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) return walk(full);
+    return /\.(js|jsx)$/.test(e.name) && !e.name.endsWith('.test.js') ? [full] : [];
+  });
+  const offenders = walk(path.join(__dirname, '..')).filter((f) => /StyleSheet\.absoluteFillObject/.test(fs.readFileSync(f, 'utf8')));
+  assert.deepStrictEqual(offenders, []);
+});
+
+test('a startup error is reported to the app: the error hook runs before Leaflet', () => {
+  const html = buildMapHtml();
+  const hook = html.indexOf('window.onerror');
+  const lib = html.indexOf('Leaflet 1.9.4');
+  assert.ok(hook > -1 && hook < lib);
+});

@@ -405,7 +405,7 @@ export const LiveJourneyScreen = () => {
             reason: 'SOS triggered during an active journey.',
             journeyId: activeJourney?._id,
             location: Number.isFinite(userLocation?.latitude)
-                ? { latitude: userLocation.latitude, longitude: userLocation.longitude, timestamp: new Date().toISOString() }
+                ? { latitude: userLocation.latitude, longitude: userLocation.longitude }
                 : undefined,
         }).catch((err) => {
             Alert.alert('SOS problem', err.message || 'Could not start the SOS. Call your local emergency number.');

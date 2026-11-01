@@ -22,6 +22,21 @@ function toCell(lat, lng) {
   return h3.latLngToCell(latitude, longitude, H3_RESOLUTION);
 }
 
+/** Where a cell's crime score came from, for the app to show next to it. Null when the cell has no crime score. */
+function crimeSourceOf(cell) {
+  const crime = cell && cell.components && cell.components.crime;
+  if (!crime || !Number.isFinite(crime.score) || !crime.meta) return null;
+  const { source, localities, note } = crime.meta;
+  return { source: source || null, localities: localities || [], note: note || null };
+}
+
+/** The headlines behind a cell's news score, for the app to show. Empty when no article names this cell. */
+function newsItemsOf(cell) {
+  const items = cell && cell.components && cell.components.news && cell.components.news.meta && cell.components.news.meta.items;
+  if (!Array.isArray(items)) return [];
+  return items.map(({ title, hazard, location, source, publishedAt }) => ({ title, hazard, location, source, publishedAt }));
+}
+
 /** Compact public view of an evaluation result (shared by every risk endpoint). */
 function publicView(h3Index, cell, result) {
   const flat = {};
@@ -61,6 +76,8 @@ function publicView(h3Index, cell, result) {
     breakdown: flat,
     componentDetails: details,
     modifiers: result.modifiers,
+    crimeSource: crimeSourceOf(cell),
+    newsItems: newsItemsOf(cell),
     computedAt: result.computedAt,
   };
 }

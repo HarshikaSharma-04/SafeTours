@@ -1,5 +1,6 @@
 const axios = require('axios');
 const newsCfg = require('../config/news.config');
+const { fetchRssArticles } = require('./news/rssFeeds');
 const logger = require('../utils/logger');
 const ApiError = require('../utils/apiError');
 
@@ -34,8 +35,8 @@ function toApiError(error) {
   return new ApiError(status || 502, `NewsData.io error: ${apiMessage}`);
 }
 
-/** @returns {Promise<Array<{title,description,source,publishedAt}>>} deduplicated by title */
-async function fetchNews() {
+/** NewsData.io only. @returns {Promise<Array<{title,description,source,publishedAt}>>} deduplicated by title */
+async function fetchNewsData() {
   const apiKey = process.env.NEWSDATA_API_KEY;
   if (!apiKey) throw new ApiError(503, 'NEWSDATA_API_KEY is not set; news data unavailable.');
 
@@ -89,4 +90,31 @@ async function fetchNews() {
   return articles;
 }
 
-module.exports = { fetchNews, parsePubDate };
+/**
+ * Every available source, with each headline once. Throws only if nothing could be fetched, so the feed then goes stale
+ * rather than reading as "no news".
+ * @returns {Promise<Array<{title,description,source,publishedAt}>>}
+ */
+async function fetchNews() {
+  const sources = [fetchRssArticles().then((r) => r.articles)];
+  if (process.env.NEWSDATA_API_KEY) sources.push(fetchNewsData());
+
+  const results = await Promise.allSettled(sources);
+  const fetched = results.filter((r) => r.status === 'fulfilled').flatMap((r) => r.value);
+  if (results.every((r) => r.status === 'rejected')) {
+    throw new ApiError(503, `News unavailable: ${results.map((r) => r.reason.message).join('; ')}`);
+  }
+  results.filter((r) => r.status === 'rejected').forEach((r) => logger.warn(`[newsService] one source failed: ${r.reason.message}`));
+
+  const seen = new Set();
+  const articles = fetched.filter((a) => {
+    const key = a.title.trim().toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  logger.info(`[newsService] ${articles.length} unique articles from ${fetched.length} fetched.`);
+  return articles;
+}
+
+module.exports = { fetchNews, fetchNewsData, parsePubDate };

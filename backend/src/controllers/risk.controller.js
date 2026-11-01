@@ -33,7 +33,15 @@ const getCells = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Bounding box is inverted (min must be <= max).');
   }
   const { cells, scanned, unknownCells, truncated } = await cellRisk.listCellsInBox({
-    minLat, maxLat, minLng, maxLng, minLevel, includeUnknown, limit, compact,
+    minLat,
+    maxLat,
+    minLng,
+    maxLng,
+    minLevel,
+    // Express 5 keeps req.query read-only, so the validator's toBoolean() cannot convert these: "false" would stay truthy.
+    includeUnknown: String(includeUnknown) === 'true',
+    limit,
+    compact: String(compact) === 'true',
   });
   res.status(200).json({
     success: true,

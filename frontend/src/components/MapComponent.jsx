@@ -1,5 +1,5 @@
-import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from 'react';
-import { StyleSheet, View, Platform } from 'react-native';
+import React, { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
+import { StyleSheet, TouchableOpacity, View, Platform } from 'react-native';
 import { colors } from '../theme/theme';
 import { Text } from './Text';
 import { NEARBY_TYPES } from '../services/nearby';
@@ -24,6 +24,10 @@ export const getRiskColors = (riskLevel) => {
 };
 
 const MAP_HTML = buildMapHtml();
+// A base URL gives tile requests a Referer, which OpenStreetMap's servers require.
+const MAP_SOURCE = { html: MAP_HTML, baseUrl: 'https://safetours.app.local/' };
+const ORIGINS = ['*'];
+const PAGE_START_TIMEOUT_MS = 12000;
 
 const zoneKey = (zone, index) => zone._id || zone.hotspotId || zone.h3Index || `zone-${index}`;
 
@@ -86,8 +90,12 @@ const toPageIncidents = (communityIncidents) => communityIncidents.flatMap((inci
 class MapErrorBoundary extends React.Component {
     state = { failed: false };
 
-    static getDerivedStateFromError() {
-        return { failed: true };
+    static getDerivedStateFromError(error) {
+        return { failed: true, message: error?.message };
+    }
+
+    componentDidCatch(error) {
+        console.warn('[Map] could not start:', error?.message);
     }
 
     render() {
@@ -96,38 +104,42 @@ class MapErrorBoundary extends React.Component {
             <View style={styles.fallback}>
                 <Text variant="headlineSm" style={{ fontWeight: 'bold', marginBottom: 6, textAlign: 'center' }}>Map could not start</Text>
                 <Text variant="bodyMd" color={colors['on-surface-variant']} style={{ textAlign: 'center' }}>
-                    This build does not include the map component. Open the app in Expo Go or install a new development build.
+                    This build may not include the map component. Open the app in Expo Go or install a new development build.
+                    {this.state.message ? `\n\n${this.state.message}` : ''}
                 </Text>
             </View>
         );
     }
 }
 
-const NativeSurface = forwardRef(({ onMessage }, ref) => {
+const NativeSurface = memo(forwardRef(({ onMessage, onLoadEnd, onFailure, onCrash }, ref) => {
     const { WebView } = require('react-native-webview');
     return (
         <WebView
             ref={ref}
             style={styles.map}
-            // A base URL gives tile requests a Referer, which OpenStreetMap's servers require.
-            source={{ html: MAP_HTML, baseUrl: 'https://safetours.app.local/' }}
-            originWhitelist={['*']}
+            source={MAP_SOURCE}
+            originWhitelist={ORIGINS}
             onMessage={(e) => onMessage(e.nativeEvent.data)}
+            onLoadEnd={onLoadEnd}
+            onError={(e) => onFailure(e.nativeEvent.description || 'The map page could not load.')}
+            onRenderProcessGone={onCrash}
+            onContentProcessDidTerminate={onCrash}
             javaScriptEnabled
             domStorageEnabled
             cacheEnabled
             // Tiles already seen stay available with a weak or absent connection.
             cacheMode="LOAD_CACHE_ELSE_NETWORK"
             setSupportMultipleWindows={false}
+            setBuiltInZoomControls={false}
             scrollEnabled={false}
             overScrollMode="never"
-            androidLayerType="hardware"
         />
     );
-});
+}));
 NativeSurface.displayName = 'NativeSurface';
 
-const WebSurface = forwardRef(({ onMessage }, ref) => {
+const WebSurface = memo(forwardRef(({ onMessage }, ref) => {
     const frame = useRef(null);
     useImperativeHandle(ref, () => ({
         postMessage: (text) => frame.current?.contentWindow?.postMessage(text, '*'),
@@ -145,8 +157,10 @@ const WebSurface = forwardRef(({ onMessage }, ref) => {
         title: 'Safety map',
         style: { position: 'absolute', inset: 0, width: '100%', height: '100%', border: 0 },
     });
-});
+}));
 WebSurface.displayName = 'WebSurface';
+
+const Surface = Platform.OS === 'web' ? WebSurface : NativeSurface;
 
 export const MapComponent = forwardRef(({
     region,
@@ -167,22 +181,55 @@ export const MapComponent = forwardRef(({
 }, ref) => {
     const surface = useRef(null);
     const ready = useRef(false);
-    const queue = useRef([]);
+    // The latest message of each kind: sent when the page becomes ready, and again if it ever has to reload.
+    const snapshot = useRef(new Map());
     const cameraPlaced = useRef(false);
     const latest = useRef({});
     latest.current = { dangerZones, nearbyPlaces, onSelectZone, onSelectPlace, onSelectDestination, destinationMarker, onRegionChangeComplete, onTilesStatus };
+    const [surfaceKey, setSurfaceKey] = useState(0);
+    const [problem, setProblem] = useState(null);
 
-    const send = useCallback((msg) => {
-        if (!ready.current || !surface.current) {
-            queue.current.push(msg);
-            return;
-        }
+    const deliver = useCallback((msg) => {
+        if (!surface.current) return;
         if (Platform.OS === 'web') {
             surface.current.postMessage(JSON.stringify(msg));
         } else {
             surface.current.injectJavaScript(`window.SafeToursMap && window.SafeToursMap.receive(${JSON.stringify(msg)}); true;`);
         }
     }, []);
+
+    const send = useCallback((msg) => {
+        const kind = msg.type === 'data' ? `data:${Object.keys(msg).join()}` : msg.type;
+        snapshot.current.delete(kind);
+        snapshot.current.set(kind, msg);
+        if (ready.current) deliver(msg);
+    }, [deliver]);
+
+    const markReady = useCallback(() => {
+        if (ready.current) return;
+        ready.current = true;
+        setProblem(null);
+        snapshot.current.forEach(deliver);
+    }, [deliver]);
+
+    const handleFailure = useCallback((message) => {
+        console.warn('[Map] page problem:', message);
+        setProblem(message);
+    }, []);
+
+    const restartPage = useCallback(() => {
+        ready.current = false;
+        setProblem(null);
+        setSurfaceKey((k) => k + 1);
+    }, []);
+
+    // The page never answered: say so on screen rather than leaving a blank map.
+    useEffect(() => {
+        const timer = setTimeout(() => {
+            if (!ready.current) handleFailure('The map page did not start in time.');
+        }, PAGE_START_TIMEOUT_MS);
+        return () => clearTimeout(timer);
+    }, [surfaceKey, handleFailure]);
 
     useImperativeHandle(ref, () => ({
         animateToRegion: (target, ms = 800) => send({ type: 'camera', region: target, ms }),
@@ -197,10 +244,10 @@ export const MapComponent = forwardRef(({
         }
         const cb = latest.current;
         if (msg.type === 'ready') {
-            ready.current = true;
-            const pending = queue.current;
-            queue.current = [];
-            pending.forEach(send);
+            console.log(`[Map] page ready, ${msg.width}x${msg.height}`);
+            markReady();
+        } else if (msg.type === 'error') {
+            handleFailure(msg.message);
         } else if (msg.type === 'zone') {
             const zone = cb.dangerZones.find((z, i) => zoneKey(z, i) === msg.id);
             if (zone && cb.onSelectZone) cb.onSelectZone(zone);
@@ -212,9 +259,10 @@ export const MapComponent = forwardRef(({
         } else if (msg.type === 'region') {
             if (cb.onRegionChangeComplete) cb.onRegionChangeComplete(msg.region);
         } else if (msg.type === 'tiles') {
+            console.log(`[Map] tiles ${msg.status}${msg.source ? ` from ${msg.source}` : ''}`);
             if (cb.onTilesStatus) cb.onTilesStatus(msg.status);
         }
-    }, [send]);
+    }, [markReady, handleFailure]);
 
     // `region` only places the first camera, like a native map's initialRegion. Later moves use animateToRegion.
     useEffect(() => {
@@ -244,13 +292,20 @@ export const MapComponent = forwardRef(({
     useEffect(() => { send({ type: 'mapType', mapType }); }, [mapType, send]);
     useEffect(() => { send({ type: 'inset', bottom: bottomInset }); }, [bottomInset, send]);
 
-    const Surface = Platform.OS === 'web' ? WebSurface : NativeSurface;
-
     return (
         <View style={styles.map}>
-            <MapErrorBoundary>
-                <Surface ref={surface} onMessage={handleMessage} />
+            <MapErrorBoundary key={surfaceKey}>
+                <Surface ref={surface} onMessage={handleMessage} onLoadEnd={markReady} onFailure={handleFailure} onCrash={restartPage} />
             </MapErrorBoundary>
+            {problem && (
+                <View style={styles.problem}>
+                    <Text variant="labelLg" style={{ color: '#fff', fontWeight: 'bold', textAlign: 'center' }}>Map problem</Text>
+                    <Text variant="labelMd" style={{ color: '#fff', textAlign: 'center', marginVertical: 6 }}>{problem}</Text>
+                    <TouchableOpacity onPress={restartPage} accessibilityLabel="Reload the map">
+                        <Text variant="labelLg" style={{ color: '#fff', fontWeight: 'bold', textDecorationLine: 'underline', textAlign: 'center' }}>Try again</Text>
+                    </TouchableOpacity>
+                </View>
+            )}
         </View>
     );
 });
@@ -259,10 +314,19 @@ MapComponent.displayName = 'MapComponent';
 
 const styles = StyleSheet.create({
     map: {
-        ...StyleSheet.absoluteFillObject,
+        ...StyleSheet.absoluteFill,
+    },
+    problem: {
+        position: 'absolute',
+        top: '28%',
+        left: 32,
+        right: 32,
+        padding: 14,
+        borderRadius: 14,
+        backgroundColor: 'rgba(40, 40, 40, 0.92)',
     },
     fallback: {
-        ...StyleSheet.absoluteFillObject,
+        ...StyleSheet.absoluteFill,
         backgroundColor: colors['surface-container'],
         alignItems: 'center',
         justifyContent: 'center',

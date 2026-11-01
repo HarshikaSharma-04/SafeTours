@@ -45,7 +45,7 @@ function checkEnv() {
   const optional = [
     ['OPENWEATHER_API_KEY', 'weather component will be unavailable'],
     ['GEOAPIFY_API_KEY', 'nearby uses the keyless Overpass fallback; crowd component unavailable'],
-    ['NEWSDATA_API_KEY', 'news component will be unavailable'],
+    ['NEWSDATA_API_KEY', 'optional: news still comes from the publishers\' RSS feeds'],
     ['GEMINI_API_KEY', 'assistant answers with the rule-based "offline assistant"'],
     ['GEMINI_MODEL', `assistant uses the built-in default (${assistantCfg.gemini.model}); set it explicitly`],
   ];

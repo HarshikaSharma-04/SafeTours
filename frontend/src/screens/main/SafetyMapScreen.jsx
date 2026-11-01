@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, StyleSheet, TouchableOpacity, TextInput, Dimensions, ActivityIndicator, Linking, ScrollView, Modal } from 'react-native';
+import { View, StyleSheet, TouchableOpacity, TextInput, Dimensions, ActivityIndicator, Linking, ScrollView, Modal, KeyboardAvoidingView, Platform } from 'react-native';
 import { Screen } from '../../components/Screen';
 import { Text } from '../../components/Text';
 import { colors, spacing, shapes, typography } from '../../theme/theme';
@@ -14,7 +14,6 @@ import { placesService } from '../../services/places';
 import { communityService } from '../../services/communityService';
 import { geofenceManager, calculateDistanceMeters } from '../../utils/geofenceManager';
 import { LocationStatusModal } from '../../components/LocationStatusModal';
-import { DemoBadge } from '../../components/DemoBadge';
 import { useNearbyServices } from '../../context/NearbyContext';
 import { NEARBY_TYPES } from '../../services/nearby';
 import { OpenChip, nearbyStatusText, typeMeta } from '../../components/NearbyParts';
@@ -42,8 +41,14 @@ const MAX_CELL_RADIUS_M = 6000;
 const CAMERA_RELOAD_DISTANCE_M = 800;
 const CAMERA_RELOAD_DELAY_MS = 700;
 const METERS_PER_DEGREE_LAT = 111320;
-// Keeps the OpenStreetMap credit above the bottom sheet, where it stays readable.
-const MAP_BOTTOM_INSET = 230;
+// Pins are only drawn once the map is zoomed in far enough for them to be readable.
+const MAX_PIN_LATITUDE_DELTA = 0.05;
+const LEGEND = [
+    { label: 'Safe', color: '#22c55e' },
+    { label: 'Low', color: '#facc15' },
+    { label: 'Moderate', color: '#f97316' },
+    { label: 'High', color: colors.error },
+];
 
 const cellRadiusFor = (region) => {
     const half = (Number(region?.latitudeDelta) || 0.03) * METERS_PER_DEGREE_LAT * 0.6;
@@ -58,14 +63,37 @@ const FACTOR_ICONS = {
     news: 'newspaper-outline',
 };
 
+const typeList = (types = []) => types.map((t) => `${t.type} ${t.incidents}`).join(', ');
+
+// What the crime number is based on: the file's records, or a sample figure, or nothing.
+const crimeSourceText = (risk) => {
+    const source = risk?.crimeSource;
+    if (!source) return risk?.breakdown ? 'Crime: no data for this area.' : null;
+    const lead = source.localities?.[0];
+    if (!lead) return 'Crime: from incident records.';
+    if (lead.source === 'records') {
+        return `Crime: based on ${lead.incidents} records for ${lead.locality}: ${typeList(lead.types)}.`;
+    }
+    return `Crime: sample figure for ${lead.locality}.`;
+};
+
+// The headlines behind the news score, newest information first.
+const newsText = (risk) => {
+    const item = risk?.newsItems?.[0];
+    if (!item) return null;
+    const more = risk.newsItems.length > 1 ? ` and ${risk.newsItems.length - 1} more` : '';
+    return `News: ${item.title} (${item.source})${more}.`;
+};
+
 // One chip per risk component. A component without usable data shows "—", never 0.
 const FactorChips = ({ risk }) => {
     const breakdown = risk?.breakdown || {};
     const details = risk?.componentDetails || {};
     const note = dataQualityNote(risk);
+    const crimeText = crimeSourceText(risk);
+    const newsLine = newsText(risk);
     return (
         <>
-            {risk?.demo && <DemoBadge style={{ marginBottom: 6 }} />}
             <View style={styles.factorGrid}>
                 {Object.keys(FACTOR_ICONS).map((key) => (
                     <View key={key} style={styles.factorChip}>
@@ -96,6 +124,16 @@ const FactorChips = ({ risk }) => {
                     </View>
                 )}
             </View>
+            {crimeText && (
+                <Text variant="labelSm" color={colors['on-surface-variant']} style={{ marginTop: 4 }}>
+                    {crimeText}
+                </Text>
+            )}
+            {newsLine && (
+                <Text variant="labelSm" color={colors['on-surface-variant']} style={{ marginTop: 4 }}>
+                    {newsLine}
+                </Text>
+            )}
             {note && (
                 <Text variant="labelSm" color={risk?.lowConfidence ? colors.error : colors['on-surface-variant']} style={{ marginTop: 4 }}>
                     {note}
@@ -104,6 +142,15 @@ const FactorChips = ({ risk }) => {
         </>
     );
 };
+
+const QuickAction = ({ icon, label, onPress, primary = false }) => (
+    <TouchableOpacity style={styles.quickAction} onPress={onPress} accessibilityLabel={label}>
+        <View style={[styles.quickIcon, primary && { backgroundColor: colors.primary }]}>
+            <Ionicons name={icon} size={20} color={primary ? colors['on-primary'] : colors.primary} />
+        </View>
+        <Text variant="labelSm" color={colors['on-surface']} numberOfLines={1}>{label}</Text>
+    </TouchableOpacity>
+);
 
 export const SafetyMapScreen = ({ route }) => {
     const navigation = useNavigation();
@@ -134,6 +181,8 @@ export const SafetyMapScreen = ({ route }) => {
     const [showCurrentRiskPanel, setShowCurrentRiskPanel] = useState(false);
     // ─────────────────────────────────────────────────────────────────────────
     const [bottomSheetExpanded, setBottomSheetExpanded] = useState(false);
+    const [sheetHeight, setSheetHeight] = useState(220);
+    const [showMapOptions, setShowMapOptions] = useState(false);
     
     // Map & Location states
     const [userLocation, setUserLocation] = useState(null);
@@ -170,6 +219,7 @@ export const SafetyMapScreen = ({ route }) => {
 
     // Community Incidents states
     const [communityIncidents, setCommunityIncidents] = useState([]);
+    const [queuedReports, setQueuedReports] = useState([]); // saved on this phone, waiting for a connection
     const [showCommunityFeed, setShowCommunityFeed] = useState(false);
     const [showReportModal, setShowReportModal] = useState(false);
     const [selectedIncidentType, setSelectedIncidentType] = useState('Harassment');
@@ -189,7 +239,9 @@ export const SafetyMapScreen = ({ route }) => {
         if (next.has(key)) next.delete(key); else next.add(key);
         return next;
     });
-    const mapPlaces = (nearby?.places || []).filter((p) => visibleTypes.has(p.type)).slice(0, 80);
+    const mapPlaces = mapRegion.latitudeDelta > MAX_PIN_LATITUDE_DELTA
+        ? []
+        : (nearby?.places || []).filter((p) => visibleTypes.has(p.type)).slice(0, 80);
 
     const mapRef = useRef(null);
     const lastSyncedCoords = useRef(null);
@@ -373,8 +425,8 @@ export const SafetyMapScreen = ({ route }) => {
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    const loadCommunityIncidents = async (coordinates = null) => {
-        setIsLoadingCommunity(true);
+    const loadCommunityIncidents = async (coordinates = null, { silent = false } = {}) => {
+        if (!silent) setIsLoadingCommunity(true);
         setCommunityError(null);
         // No fallback place: without a position there is nothing to look up.
         const lat = coordinates?.latitude ?? userLocation?.latitude;
@@ -387,7 +439,9 @@ export const SafetyMapScreen = ({ route }) => {
         const res = await communityService.getNearbyIncidents(lat, lng, 5000);
         if (res.success) {
             setCommunityIncidents(res.data || []);
-        } else {
+            // A report the outbox has uploaded is now in this list, so its local copy must not count twice.
+            if (!conn.isOffline) setQueuedReports([]);
+        } else if (!silent) {
             setCommunityError(res.error?.message || 'Could not load nearby community reports.');
         }
         setIsLoadingCommunity(false);
@@ -423,9 +477,38 @@ export const SafetyMapScreen = ({ route }) => {
         if (res.success) {
             setIncidentDescription('');
             setShowReportModal(false);
-            loadCommunityIncidents();
-            setGeofenceToast(res.queued ? `Saved offline: ${selectedIncidentType} will be reported when you are online` : `Incident reported: ${selectedIncidentType}`);
+
+            // The count moves at once, whatever happens to the refresh below.
+            if (res.queued) {
+                setQueuedReports((prev) => [{
+                    _id: `queued-${Date.now()}`,
+                    queued: true,
+                    incidentType: selectedIncidentType,
+                    description: incidentDescription.trim(),
+                    latitude: lat,
+                    longitude: lng,
+                    createdAt: new Date().toISOString(),
+                }, ...prev]);
+            } else if (res.data?._id) {
+                setCommunityIncidents((prev) => [res.data, ...prev.filter((inc) => inc._id !== res.data._id)]);
+            }
+
+            setGeofenceToast(
+                res.queued ? `Saved offline: ${selectedIncidentType} will be reported when you are online`
+                : res.data?.merged ? `Added to a matching report nearby: ${selectedIncidentType}`
+                : `Incident reported: ${selectedIncidentType}`
+            );
             setTimeout(() => setGeofenceToast(null), 4000);
+
+            if (!res.queued) {
+                // The server has already rescored this area, so the risk shown can include this report straight away.
+                loadCommunityIncidents({ latitude: lat, longitude: lng }, { silent: true });
+                fetchCurrentLocationRiskData(lat, lng);
+                loadDangerZones(null, true);
+                if (selectedZone?.h3Index) {
+                    riskService.getCell(selectedZone.h3Index).then((r) => { if (r.success && r.data) setSelectedZoneRisk(r.data); });
+                }
+            }
         } else {
             setIncidentMessage(res.error?.message || 'Failed to report incident.');
         }
@@ -496,6 +579,9 @@ export const SafetyMapScreen = ({ route }) => {
     useEffect(() => {
         const autoRefreshInterval = setInterval(() => {
             loadDangerZones(null, true);
+            // Other people's reports appear without a manual refresh.
+            const last = locationBus.getLast();
+            if (last) loadCommunityIncidents(last, { silent: true });
         }, 30000);
 
         return () => clearInterval(autoRefreshInterval);
@@ -697,10 +783,6 @@ export const SafetyMapScreen = ({ route }) => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [conn.isOffline]);
 
-    const toggleMapType = () => {
-        setMapType(prev => prev === 'standard' ? 'hybrid' : 'standard');
-    };
-
     const handleSelectZone = async (zone) => {
         setSelectedZone(zone);
         setSelectedZoneRisk(null);
@@ -742,6 +824,30 @@ export const SafetyMapScreen = ({ route }) => {
     const panelRiskData = selectedZone ? (selectedZoneRisk || selectedZone) : currentLocationRiskData;
     const panelRiskInfo = buildRiskInfo(panelRiskData);
 
+    // One quiet line in the sheet for anything the map cannot show right now.
+    const mapNotice = (() => {
+        if (conn.isOffline || riskMeta?.source === 'device') {
+            return riskMeta?.source === 'device' && dangerZones.length
+                ? `Offline: saved risk data from ${formatAge(Date.now() - riskMeta.fetchedAt) || 'just now'}`
+                : 'Offline: download this area in Settings to see risk here';
+        }
+        if (tilesFailed) return 'Base map not available right now';
+        if (!dangerZones.length && !isLoadingDangerZones && cellCoverage) {
+            return cellCoverage.scanned === 0 ? 'SafeTours covers Mumbai: search a Mumbai place' : 'Not enough data to rate this area yet';
+        }
+        return null;
+    })();
+
+    // Everyone who has reported nearby: each report, each person who confirmed one, and reports waiting to upload.
+    const allReports = [...queuedReports, ...communityIncidents];
+    const reportCount = allReports.reduce((total, inc) => total + 1 + (inc.confirmationCount || 0), 0);
+
+    const openReport = () => {
+        setIncidentMessage(null);
+        if (reportCategories.length && !reportCategories.includes(selectedIncidentType)) setSelectedIncidentType(reportCategories[0]);
+        setShowReportModal(true);
+    };
+
     return (
         <Screen style={styles.container} isSafe={false}>
             {/* Map Component */}
@@ -753,73 +859,17 @@ export const SafetyMapScreen = ({ route }) => {
                 destinationMarker={destination}
                 onSelectDestination={handleOpenDestinationDetails}
                 mapType={mapType}
-                bottomInset={MAP_BOTTOM_INSET}
+                bottomInset={sheetHeight}
                 onTilesStatus={(status) => setTilesFailed(status === 'failed')}
                 dangerZones={filteredDangerZones}
-                communityIncidents={communityIncidents}
+                communityIncidents={allReports}
                 selectedZone={activeZone}
                 onSelectZone={handleSelectZone}
                 nearbyPlaces={mapPlaces}
                 onSelectPlace={setSelectedPlace}
             />
 
-            {/* Visible whenever any displayed risk includes demo data */}
-            {(currentLocationRiskData?.demo || destinationRiskData?.demo || dangerZones.some((z) => z.demo)) && (
-                <View style={styles.demoBadgeFloating} pointerEvents="none">
-                    <DemoBadge />
-                </View>
-            )}
-
-            {/* Offline: what the map is showing */}
-            {(conn.isOffline || riskMeta?.source === 'device' || geofenceResult?.source === 'device') && (
-                <View style={styles.offlinePill} pointerEvents="none">
-                    <Ionicons name="cloud-offline" size={14} color="#fff" />
-                    <Text variant="labelSm" style={{ color: '#fff', fontWeight: '700', flexShrink: 1 }}>
-                        {geofenceResult?.source === 'device' ? 'Offline check · ' : 'Offline · '}
-                        {riskMeta?.source === 'device' && dangerZones.length
-                            ? `cached risk cells, updated ${formatAge(Date.now() - riskMeta.fetchedAt) || 'just now'}`
-                            : dangerZones.length ? 'showing last loaded cells' : 'no cached risk data here; download this area in Settings'}
-                        {tilesFailed ? ' · base map not available' : ''}
-                    </Text>
-                </View>
-            )}
-
-            {/* Nearby services: type toggles + data-quality line */}
-            <View style={[styles.nearbyToggles, destination && !showDestinationPanel && { top: 206 }]} pointerEvents="box-none">
-                <View style={styles.nearbyToggleRow}>
-                    {NEARBY_TYPES.map((t) => {
-                        const on = visibleTypes.has(t.key);
-                        return (
-                            <TouchableOpacity
-                                key={t.key}
-                                onPress={() => toggleType(t.key)}
-                                style={[styles.nearbyChip, on && { backgroundColor: t.color, borderColor: t.color }]}
-                                accessibilityLabel={`${on ? 'Hide' : 'Show'} ${t.label}`}
-                            >
-                                <Ionicons name={t.icon} size={14} color={on ? '#fff' : t.color} />
-                                <Text variant="labelSm" style={{ color: on ? '#fff' : colors['on-surface'], fontWeight: '700' }}>{t.label}</Text>
-                            </TouchableOpacity>
-                        );
-                    })}
-                </View>
-                {nearby && nearbyStatusText(nearby) ? (
-                    <View style={styles.nearbyNote}>
-                        <Text variant="labelSm" color={colors['on-surface-variant']}>{nearbyStatusText(nearby)}</Text>
-                    </View>
-                ) : null}
-                {/* Why no hexagons are showing: an empty map must not read as "all clear" */}
-                {!dangerZones.length && !isLoadingDangerZones && cellCoverage && riskMeta?.source !== 'device' ? (
-                    <View style={styles.nearbyNote}>
-                        <Text variant="labelSm" color={colors.error}>
-                            {cellCoverage.scanned === 0
-                                ? 'No risk data here: SafeTours covers Mumbai. Search a Mumbai place to see cells.'
-                                : 'Not enough data to rate this area yet.'}
-                        </Text>
-                    </View>
-                ) : null}
-            </View>
-
-            {/* Top Search & Diagnostics Bar */}
+            {/* Top Search Bar */}
             <View style={styles.topSearchContainer}>
                 <View style={styles.searchHeaderRow}>
                     <TouchableOpacity style={styles.menuButton} onPress={toggleDrawer} accessibilityLabel="Open menu">
@@ -829,7 +879,7 @@ export const SafetyMapScreen = ({ route }) => {
                         <Ionicons name="search" size={20} color={colors['on-surface-variant']} />
                         <TextInput 
                             style={styles.searchInput}
-                            placeholder="Search destination, address, or zones..."
+                            placeholder="Search a place in Mumbai"
                             placeholderTextColor={colors['on-surface-variant']}
                             value={searchQuery}
                             onChangeText={handleSearchTextChange}
@@ -857,19 +907,6 @@ export const SafetyMapScreen = ({ route }) => {
                         )}
                     </View>
                 </View>
-
-                {/* Floating Searched Location Chip with "View Details" action */}
-                {destination && !showDestinationPanel && (
-                    <TouchableOpacity style={styles.destinationMarkerChip} onPress={handleOpenDestinationDetails}>
-                        <Ionicons name="location-sharp" size={18} color="#e11d48" />
-                        <Text variant="labelLg" style={{ flex: 1, fontWeight: 'bold' }} numberOfLines={1}>
-                            {destination.name}
-                        </Text>
-                        <View style={styles.viewDetailsBtnChip}>
-                            <Text variant="labelMd" style={{ color: colors.white, fontWeight: 'bold' }}>View Details</Text>
-                        </View>
-                    </TouchableOpacity>
-                )}
 
                 {/* Autocomplete Suggestions Dropdown */}
                 {isSearchFocused && (suggestions.length > 0 || isSuggestionsLoading) && (
@@ -918,34 +955,6 @@ export const SafetyMapScreen = ({ route }) => {
                     </View>
                 )}
 
-                {/* Connection, Live Tracking & Diagnostics Trigger Status Row */}
-                <View style={styles.statusRow}>
-                    <TouchableOpacity style={styles.statusChip} onPress={() => setShowStatusModal(true)}>
-                        <Ionicons 
-                            name={trackingActive ? "radio" : "warning"} 
-                            size={16} 
-                            color={trackingActive ? "green" : colors.error} 
-                        />
-                        <Text variant="labelMd" style={{ color: colors['on-surface'], fontWeight: 'bold' }}>
-                            {trackingActive ? "LIVE TRACKING" : "GPS Required"}
-                        </Text>
-                    </TouchableOpacity>
-
-                    <TouchableOpacity style={styles.statusChip} onPress={() => { loadCommunityIncidents(); setShowCommunityFeed(true); }}>
-                        <Ionicons name="people-outline" size={16} color={colors.primary} />
-                        <Text variant="labelMd" style={{ color: colors['on-surface'] }}>
-                            Incidents ({communityIncidents.length})
-                        </Text>
-                    </TouchableOpacity>
-
-                    <TouchableOpacity style={styles.statusChip} onPress={() => setShowStatusModal(true)}>
-                        <Ionicons name="hardware-chip-outline" size={16} color={colors.primary} />
-                        <Text variant="labelMd" style={{ color: colors['on-surface'] }}>
-                            Diagnostics
-                        </Text>
-                    </TouchableOpacity>
-                </View>
-
                 {/* Geofence Event Alert Toast Banner */}
                 {geofenceToast && (
                     <View style={styles.geofenceToastBanner}>
@@ -957,51 +966,17 @@ export const SafetyMapScreen = ({ route }) => {
                 )}
             </View>
 
-            {/* Right Floating Actions */}
-            <View style={styles.floatingActionsRight}>
-                <TouchableOpacity style={styles.fabSmall} onPress={handleRecenter}>
-                    <Ionicons name="locate" size={24} color={colors['on-surface-variant']} />
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.fabSmall} onPress={() => { loadDangerZones(); loadCommunityIncidents(); }}>
-                    {isLoadingLocation || isLoadingDangerZones ? (
-                        <ActivityIndicator size="small" color={colors.primary} />
-                    ) : (
-                        <Ionicons name="refresh" size={24} color={colors['on-surface-variant']} />
-                    )}
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.fabSmall} onPress={() => setShowReportModal(true)}>
-                    <Ionicons name="megaphone-outline" size={24} color={colors.primary} />
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.fabSmall} onPress={toggleMapType}>
-                    <Ionicons name="layers" size={24} color={colors['on-surface-variant']} />
-                </TouchableOpacity>
-
-                {/* Risk Legend */}
-                <View style={styles.legendContainer}>
-                    <Text variant="labelMd" color={colors['on-surface-variant']} style={{ marginBottom: 4, textTransform: 'uppercase' }}>Risk Legend</Text>
-                    <View style={styles.legendItem}>
-                        <View style={[styles.legendDot, { backgroundColor: '#22c55e' }]} />
-                        <Text variant="labelMd">Safe</Text>
-                    </View>
-                    <View style={styles.legendItem}>
-                        <View style={[styles.legendDot, { backgroundColor: '#facc15' }]} />
-                        <Text variant="labelMd">Low</Text>
-                    </View>
-                    <View style={styles.legendItem}>
-                        <View style={[styles.legendDot, { backgroundColor: '#f97316' }]} />
-                        <Text variant="labelMd">Moderate</Text>
-                    </View>
-                    <View style={styles.legendItem}>
-                        <View style={[styles.legendDot, { backgroundColor: colors.error }]} />
-                        <Text variant="labelMd">High</Text>
-                    </View>
+            {/* Location and SOS sit just above the sheet, whatever its height */}
+            {!isSearchFocused && (
+                <View style={[styles.fabColumn, { bottom: sheetHeight + spacing.sm }]} pointerEvents="box-none">
+                    <TouchableOpacity style={styles.fabSmall} onPress={handleRecenter} accessibilityLabel="Go to my location">
+                        <Ionicons name="locate" size={22} color={colors['on-surface-variant']} />
+                    </TouchableOpacity>
+                    <TouchableOpacity style={styles.sosFab} onPress={() => navigation.navigate('SOS')} accessibilityLabel="Open SOS">
+                        <Ionicons name="warning" size={26} color={colors['on-error']} />
+                    </TouchableOpacity>
                 </View>
-            </View>
-
-            {/* Main SOS FAB */}
-            <TouchableOpacity style={styles.sosFab} onPress={() => navigation.navigate('SOS')}>
-                <Ionicons name="warning" size={32} color={colors['on-error']} />
-            </TouchableOpacity>
+            )}
 
             {/* Location Permission Fallback Overlay */}
             {permissionStatus !== 'granted' && !browseWithoutLocation && (
@@ -1065,10 +1040,14 @@ export const SafetyMapScreen = ({ route }) => {
 
             {/* Bottom Sheet Drawer — hidden while search is focused */}
             {!isSearchFocused && (
-            <View style={[styles.bottomSheet, bottomSheetExpanded && styles.bottomSheetExpanded]}>
-                <TouchableOpacity 
+            <View style={styles.bottomSheet} onLayout={(e) => setSheetHeight(e.nativeEvent.layout.height)}>
+                <TouchableOpacity
                     style={styles.sheetHandleContainer}
-                    onPress={() => setBottomSheetExpanded(!bottomSheetExpanded)}
+                    onPress={() => {
+                        setShowDestinationPanel(false);
+                        clearSelectedZone();
+                    }}
+                    accessibilityLabel="Close details"
                 >
                     <View style={styles.sheetHandle} />
                 </TouchableOpacity>
@@ -1210,6 +1189,16 @@ export const SafetyMapScreen = ({ route }) => {
                     </View>
                 )}
 
+                {/* The searched place, in the sheet rather than floating over the map */}
+                {destination && !showDestinationPanel && !showCurrentRiskPanel && (
+                    <TouchableOpacity style={styles.viewCurrentRiskChip} onPress={handleOpenDestinationDetails}>
+                        <Ionicons name="location-sharp" size={18} color="#e11d48" />
+                        <Text variant="labelLg" style={{ fontWeight: 'bold', flex: 1 }} numberOfLines={1}>{destination.name}</Text>
+                        <Text variant="labelMd" color={colors.primary} style={{ fontWeight: 'bold' }}>View risk</Text>
+                        <Ionicons name="chevron-up" size={16} color={colors['on-surface-variant']} />
+                    </TouchableOpacity>
+                )}
+
                 {/* Danger Zone Fetch Error Banner */}
                 {dangerZoneError && (
                     <View style={styles.errorBanner}>
@@ -1225,7 +1214,7 @@ export const SafetyMapScreen = ({ route }) => {
                 {!showDestinationPanel && (
                     <>
                         {/* Button chip to reveal risk panel — shown when panel is closed and not loading */}
-                        {!showCurrentRiskPanel && !isCurrentRiskLoading && (
+                        {!showCurrentRiskPanel && !isCurrentRiskLoading && !destination && (
                             <TouchableOpacity
                                 style={styles.viewCurrentRiskChip}
                                 onPress={() => {
@@ -1273,7 +1262,7 @@ export const SafetyMapScreen = ({ route }) => {
 
                         {/* Risk detail panel — shown only when user taps the button */}
                         {showCurrentRiskPanel && !isCurrentRiskLoading && (panelRiskInfo || activeZone) && (
-                            <>
+                            <ScrollView style={styles.riskPanelScroll} showsVerticalScrollIndicator={false}>
                                 {(() => {
                                     const activeColors = panelRiskInfo ? panelRiskInfo.colors : activeRiskColors;
                                     const displayScore = panelRiskInfo ? panelRiskInfo.score : activeZone?.totalRiskScore;
@@ -1353,27 +1342,102 @@ export const SafetyMapScreen = ({ route }) => {
                                         </>
                                     );
                                 })()}
-                            </>
+                            </ScrollView>
                         )}
                     </>
                 )}
 
-                <View style={[styles.actionButtonsRow, { marginTop: spacing.md }]}>
-                    <TouchableOpacity style={styles.routeBtn} onPress={() => navigation.navigate('LiveJourney')}>
-                        <Ionicons name="navigate" size={20} color={colors['on-primary']} />
-                        <Text variant="labelLg" color={colors['on-primary']}>Start Journey</Text>
-                    </TouchableOpacity>
+                {!showDestinationPanel && !showCurrentRiskPanel && (
+                    <>
+                        <View style={styles.quickActions}>
+                            <QuickAction icon="megaphone" label="Report" primary onPress={openReport} />
+                            <QuickAction icon="people" label={`Reports (${reportCount})`} onPress={() => { loadCommunityIncidents(); setShowCommunityFeed(true); }} />
+                            <QuickAction icon="navigate" label="Journey" onPress={() => navigation.navigate('LiveJourney')} />
+                            <QuickAction icon="share-social" label="Share" onPress={() => shareLocation(userLocation)} />
+                            <QuickAction icon="options" label="Options" onPress={() => setShowMapOptions(true)} />
+                        </View>
 
-                    <TouchableOpacity style={styles.shareBtn} onPress={() => shareLocation(userLocation)}>
-                        <Ionicons name="share-social" size={20} color={colors.primary} />
-                        <Text variant="labelLg" color={colors.primary}>Share Location</Text>
-                    </TouchableOpacity>
-                </View>
-                
-                {/* Space for bottom nav */}
-                <View style={{ height: 60 }} />
+                        <View style={styles.legendRow}>
+                            {LEGEND.map((item) => (
+                                <View key={item.label} style={styles.legendItem}>
+                                    <View style={[styles.legendDot, { backgroundColor: item.color }]} />
+                                    <Text variant="labelSm" color={colors['on-surface-variant']}>{item.label}</Text>
+                                </View>
+                            ))}
+                        </View>
+
+                        {mapNotice && (
+                            <Text variant="labelSm" color={colors['on-surface-variant']} style={{ textAlign: 'center', marginTop: spacing.xs }}>
+                                {mapNotice}
+                            </Text>
+                        )}
+                    </>
+                )}
             </View>
             )}
+
+            {/* Everything that used to float over the map */}
+            <Modal visible={showMapOptions} transparent animationType="slide" onRequestClose={() => setShowMapOptions(false)}>
+                <TouchableOpacity style={styles.placeBackdrop} activeOpacity={1} onPress={() => setShowMapOptions(false)}>
+                    <TouchableOpacity style={styles.placeSheet} activeOpacity={1}>
+                        <View style={styles.sheetHeader}>
+                            <Text variant="headlineSm" style={{ fontWeight: 'bold' }}>Map options</Text>
+                            <TouchableOpacity onPress={() => setShowMapOptions(false)} accessibilityLabel="Close">
+                                <Ionicons name="close" size={24} color={colors['on-surface-variant']} />
+                            </TouchableOpacity>
+                        </View>
+
+                        <Text variant="labelLg" style={styles.optionTitle}>Map style</Text>
+                        <View style={styles.optionRow}>
+                            {[{ key: 'standard', label: 'Standard' }, { key: 'hybrid', label: 'Satellite' }].map((option) => {
+                                const on = mapType === option.key;
+                                return (
+                                    <TouchableOpacity
+                                        key={option.key}
+                                        onPress={() => setMapType(option.key)}
+                                        style={[styles.nearbyChip, on && { backgroundColor: colors.primary, borderColor: colors.primary }]}
+                                    >
+                                        <Text variant="labelMd" style={{ color: on ? '#fff' : colors['on-surface'], fontWeight: '700' }}>{option.label}</Text>
+                                    </TouchableOpacity>
+                                );
+                            })}
+                        </View>
+
+                        <Text variant="labelLg" style={styles.optionTitle}>Show nearby places</Text>
+                        <View style={styles.optionRow}>
+                            {NEARBY_TYPES.map((t) => {
+                                const on = visibleTypes.has(t.key);
+                                return (
+                                    <TouchableOpacity
+                                        key={t.key}
+                                        onPress={() => toggleType(t.key)}
+                                        style={[styles.nearbyChip, on && { backgroundColor: t.color, borderColor: t.color }]}
+                                        accessibilityLabel={`${on ? 'Hide' : 'Show'} ${t.label}`}
+                                    >
+                                        <Ionicons name={t.icon} size={14} color={on ? '#fff' : t.color} />
+                                        <Text variant="labelMd" style={{ color: on ? '#fff' : colors['on-surface'], fontWeight: '700' }}>{t.label}</Text>
+                                    </TouchableOpacity>
+                                );
+                            })}
+                        </View>
+                        <Text variant="labelSm" color={colors['on-surface-variant']} style={{ marginTop: 6 }}>
+                            Zoom in to see the pins.{nearby && nearbyStatusText(nearby) ? ` ${nearbyStatusText(nearby)}` : ''}
+                        </Text>
+
+                        <Text variant="labelLg" style={styles.optionTitle}>Data</Text>
+                        <View style={styles.optionRow}>
+                            <TouchableOpacity style={styles.nearbyChip} onPress={() => { loadDangerZones(); loadCommunityIncidents(); setShowMapOptions(false); }}>
+                                <Ionicons name="refresh" size={14} color={colors.primary} />
+                                <Text variant="labelMd" style={{ fontWeight: '700', color: colors['on-surface'] }}>Refresh map</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity style={styles.nearbyChip} onPress={() => { setShowMapOptions(false); setShowStatusModal(true); }}>
+                                <Ionicons name={trackingActive ? 'radio' : 'warning'} size={14} color={trackingActive ? 'green' : colors.error} />
+                                <Text variant="labelMd" style={{ fontWeight: '700', color: colors['on-surface'] }}>{trackingActive ? 'Live tracking on' : 'GPS required'}</Text>
+                            </TouchableOpacity>
+                        </View>
+                    </TouchableOpacity>
+                </TouchableOpacity>
+            </Modal>
 
             {/* Tapped nearby place: name, distance, Call (only with a phone number) and Directions */}
             <Modal visible={Boolean(selectedPlace)} transparent animationType="slide" onRequestClose={() => setSelectedPlace(null)}>
@@ -1435,11 +1499,11 @@ export const SafetyMapScreen = ({ route }) => {
 
             {/* Report Community Incident Modal */}
             <Modal visible={showReportModal} transparent animationType="slide" onRequestClose={() => setShowReportModal(false)}>
-                <View style={styles.permissionOverlay}>
+                <KeyboardAvoidingView style={styles.permissionOverlay} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
                     <View style={styles.permissionCard}>
                         <View style={styles.sheetHeader}>
                             <Text variant="headlineSm" style={{ fontWeight: 'bold', color: colors.primary }}>
-                                Report Community Incident
+                                Report an incident
                             </Text>
                             <TouchableOpacity onPress={() => setShowReportModal(false)}>
                                 <Ionicons name="close" size={24} color={colors['on-surface-variant']} />
@@ -1452,7 +1516,10 @@ export const SafetyMapScreen = ({ route }) => {
                             </View>
                         )}
 
-                        <Text variant="labelLg" style={{ alignSelf: 'flex-start', marginBottom: 6 }}>Incident Category</Text>
+                        <Text variant="labelMd" color={colors['on-surface-variant']} style={{ alignSelf: 'flex-start', marginBottom: spacing.sm }}>
+                            {userLocation ? 'This is filed at your current location and raises the risk score for this area.' : 'Your location is needed to file a report. Waiting for GPS.'}
+                        </Text>
+                        <Text variant="labelLg" style={{ alignSelf: 'flex-start', marginBottom: 6 }}>What happened?</Text>
                         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: spacing.md, maxHeight: 44 }}>
                             {reportCategories.map(cat => (
                                 <TouchableOpacity 
@@ -1490,12 +1557,12 @@ export const SafetyMapScreen = ({ route }) => {
                                 <ActivityIndicator size="small" color={colors.white} />
                             ) : (
                                 <Text variant="labelLg" color={colors.white} style={{ fontWeight: 'bold' }}>
-                                    Submit Incident Report
+                                    Submit report
                                 </Text>
                             )}
                         </TouchableOpacity>
                     </View>
-                </View>
+                </KeyboardAvoidingView>
             </Modal>
 
             {/* Community Incidents Feed Modal */}
@@ -1504,7 +1571,7 @@ export const SafetyMapScreen = ({ route }) => {
                     <View style={[styles.permissionCard, { maxHeight: '80%' }]}>
                         <View style={styles.sheetHeader}>
                             <Text variant="headlineSm" style={{ fontWeight: 'bold', color: colors.primary }}>
-                                Nearby Community Reports ({communityIncidents.length})
+                                Reports nearby ({reportCount})
                             </Text>
                             <TouchableOpacity onPress={() => setShowCommunityFeed(false)}>
                                 <Ionicons name="close" size={24} color={colors['on-surface-variant']} />
@@ -1522,13 +1589,13 @@ export const SafetyMapScreen = ({ route }) => {
                                     <Text variant="labelMd" color={colors.white}>Try Again</Text>
                                 </TouchableOpacity>
                             </View>
-                        ) : communityIncidents.length === 0 ? (
+                        ) : allReports.length === 0 ? (
                             <Text variant="bodyMd" color={colors['on-surface-variant']} style={{ textAlign: 'center', marginVertical: spacing.xl }}>
-                                No community incidents reported nearby.
+                                No incidents reported nearby.
                             </Text>
                         ) : (
                             <ScrollView contentContainerStyle={{ gap: spacing.md, paddingVertical: spacing.sm }}>
-                                {communityIncidents.map(inc => (
+                                {allReports.map(inc => (
                                     <View key={inc._id || inc.id} style={styles.communityCard}>
                                         <View style={styles.sheetHeader}>
                                             <Text variant="labelLg" style={{ fontWeight: 'bold', color: colors.primary }}>
@@ -1539,6 +1606,9 @@ export const SafetyMapScreen = ({ route }) => {
                                             </Text>
                                         </View>
                                         <Text variant="bodyMd" style={{ marginBottom: 8 }}>{inc.description}</Text>
+                                        {inc.queued ? (
+                                            <Text variant="labelMd" color={colors['on-surface-variant']}>Saved on this phone. It uploads when you are back online.</Text>
+                                        ) : (
                                         <View style={styles.votingRow}>
                                             <TouchableOpacity 
                                                 style={styles.voteBtn}
@@ -1546,7 +1616,7 @@ export const SafetyMapScreen = ({ route }) => {
                                             >
                                                 <Ionicons name="thumbs-up-outline" size={16} color="green" />
                                                 <Text variant="labelMd" style={{ color: 'green', fontWeight: 'bold' }}>
-                                                    Confirm ({inc.upvotesCount ?? inc.confirmationsCount ?? 0})
+                                                    Confirm ({inc.confirmationCount ?? 0})
                                                 </Text>
                                             </TouchableOpacity>
 
@@ -1556,14 +1626,25 @@ export const SafetyMapScreen = ({ route }) => {
                                             >
                                                 <Ionicons name="thumbs-down-outline" size={16} color={colors.error} />
                                                 <Text variant="labelMd" style={{ color: colors.error, fontWeight: 'bold' }}>
-                                                    False Report ({inc.downvotesCount ?? inc.falseReportCount ?? 0})
+                                                    False Report ({inc.falseReportCount ?? 0})
                                                 </Text>
                                             </TouchableOpacity>
                                         </View>
+                                        )}
                                     </View>
                                 ))}
                             </ScrollView>
                         )}
+
+                        <TouchableOpacity
+                            style={styles.permissionButton}
+                            onPress={() => {
+                                setShowCommunityFeed(false);
+                                openReport();
+                            }}
+                        >
+                            <Text variant="labelLg" color={colors.white} style={{ fontWeight: 'bold' }}>Report an incident</Text>
+                        </TouchableOpacity>
                     </View>
                 </View>
             </Modal>
@@ -1572,10 +1653,6 @@ export const SafetyMapScreen = ({ route }) => {
 };
 
 const styles = StyleSheet.create({
-    offlinePill: {
-        position: 'absolute', top: 118, right: 12, maxWidth: '68%', zIndex: 20, flexDirection: 'row', alignItems: 'center', gap: 6,
-        backgroundColor: 'rgba(60,60,60,0.88)', borderRadius: 16, paddingHorizontal: 12, paddingVertical: 6,
-    },
     container: {
         flex: 1,
         backgroundColor: colors.background,
@@ -1611,23 +1688,14 @@ const styles = StyleSheet.create({
         borderColor: 'rgba(217, 194, 183, 0.3)',
         flexShrink: 0,
     },
-    nearbyToggles: { position: 'absolute', top: 150, left: 12, right: 12, zIndex: 20 },
-    nearbyToggleRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
     nearbyChip: {
         flexDirection: 'row', alignItems: 'center', gap: 4, paddingHorizontal: 10, paddingVertical: 5,
         borderRadius: 999, backgroundColor: 'rgba(255,255,255,0.95)', borderWidth: 1, borderColor: 'rgba(0,0,0,0.12)',
     },
-    nearbyNote: { alignSelf: 'flex-start', marginTop: 6, paddingHorizontal: 10, paddingVertical: 3, borderRadius: 999, backgroundColor: 'rgba(255,255,255,0.92)' },
     placeBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.35)', justifyContent: 'flex-end' },
     placeSheet: { backgroundColor: '#fff', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20, paddingBottom: 32 },
     placeIcon: { width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center' },
     placeBtn: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 14, borderRadius: 14 },
-    demoBadgeFloating: {
-        position: 'absolute',
-        top: 118,
-        left: 16,
-        zIndex: 20,
-    },
     searchBar: {
         flex: 1,
         flexDirection: 'row',
@@ -1653,12 +1721,6 @@ const styles = StyleSheet.create({
     },
     micButton: {
         padding: 6,
-    },
-    statusRow: {
-        flexDirection: 'row',
-        marginTop: spacing.xs,
-        gap: spacing.sm,
-        flexWrap: 'wrap',
     },
     statusChip: {
         flexDirection: 'row',
@@ -1686,14 +1748,6 @@ const styles = StyleSheet.create({
         shadowRadius: 8,
         elevation: 6,
     },
-    floatingActionsRight: {
-        position: 'absolute',
-        top: 180,
-        right: spacing.md,
-        alignItems: 'flex-end',
-        gap: spacing.sm,
-        zIndex: 10,
-    },
     fabSmall: {
         width: 48,
         height: 48,
@@ -1709,46 +1763,72 @@ const styles = StyleSheet.create({
         borderWidth: 1,
         borderColor: 'rgba(217, 194, 183, 0.3)',
     },
-    legendContainer: {
-        marginTop: spacing.sm,
-        backgroundColor: 'rgba(255, 255, 255, 0.95)',
-        padding: spacing.md,
-        borderRadius: 20,
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.1,
-        shadowRadius: 8,
-        elevation: 4,
-        borderWidth: 1,
-        borderColor: 'rgba(217, 194, 183, 0.3)',
-    },
     legendItem: {
         flexDirection: 'row',
         alignItems: 'center',
-        gap: 8,
-        marginVertical: 4,
+        gap: 4,
     },
     legendDot: {
         width: 12,
         height: 12,
         borderRadius: 6,
     },
-    sosFab: {
+    fabColumn: {
         position: 'absolute',
-        bottom: 240,
-        right: spacing.lg,
-        width: 64,
-        height: 64,
-        borderRadius: 32,
+        right: spacing.md,
+        alignItems: 'center',
+        gap: spacing.sm,
+        zIndex: 20,
+    },
+    sosFab: {
+        width: 52,
+        height: 52,
+        borderRadius: 26,
         backgroundColor: colors.error,
         alignItems: 'center',
         justifyContent: 'center',
         shadowColor: colors.error,
-        shadowOffset: { width: 0, height: 10 },
+        shadowOffset: { width: 0, height: 6 },
         shadowOpacity: 0.4,
-        shadowRadius: 15,
+        shadowRadius: 10,
         elevation: 8,
-        zIndex: 20,
+    },
+    quickActions: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        marginTop: spacing.sm,
+    },
+    quickAction: {
+        flex: 1,
+        alignItems: 'center',
+        gap: 4,
+    },
+    quickIcon: {
+        width: 46,
+        height: 46,
+        borderRadius: 23,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: colors['surface-container-high'],
+    },
+    legendRow: {
+        flexDirection: 'row',
+        justifyContent: 'center',
+        gap: spacing.md,
+        marginTop: spacing.md,
+    },
+    riskPanelScroll: {
+        maxHeight: height * 0.45,
+    },
+    optionTitle: {
+        fontWeight: 'bold',
+        marginTop: spacing.md,
+        marginBottom: 6,
+    },
+    optionRow: {
+        flexDirection: 'row',
+        flexWrap: 'wrap',
+        gap: 8,
     },
     bottomSheet: {
         position: 'absolute',
@@ -1758,23 +1838,19 @@ const styles = StyleSheet.create({
         backgroundColor: colors.surface,
         borderTopLeftRadius: 32,
         borderTopRightRadius: 32,
-        padding: spacing.lg,
-        paddingBottom: spacing.xxl,
+        paddingHorizontal: spacing.lg,
+        paddingTop: spacing.xs,
+        paddingBottom: spacing.lg,
         shadowColor: '#000',
         shadowOffset: { width: 0, height: -10 },
         shadowOpacity: 0.1,
         shadowRadius: 20,
         elevation: 15,
         zIndex: 30,
-        transform: [{ translateY: 60 }],
-    },
-    bottomSheetExpanded: {
-        transform: [{ translateY: 0 }],
     },
     sheetHandleContainer: {
         alignItems: 'center',
         paddingVertical: spacing.sm,
-        marginBottom: spacing.sm,
     },
     sheetHandle: {
         width: 48,
@@ -1879,7 +1955,7 @@ const styles = StyleSheet.create({
         gap: 8,
     },
     permissionOverlay: {
-        ...StyleSheet.absoluteFillObject,
+        ...StyleSheet.absoluteFill,
         backgroundColor: 'rgba(33, 26, 22, 0.5)',
         justifyContent: 'center',
         alignItems: 'center',
@@ -1949,7 +2025,7 @@ const styles = StyleSheet.create({
         borderWidth: 1,
         borderColor: 'rgba(217, 194, 183, 0.2)',
         width: '100%',
-    },
+    },
     communityState: {
         alignItems: 'center',
         justifyContent: 'center',
@@ -2032,29 +2108,6 @@ const styles = StyleSheet.create({
     },
     clearDestBtn: {
         padding: 4,
-    },
-    destinationMarkerChip: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        gap: spacing.sm,
-        backgroundColor: colors.surface,
-        paddingHorizontal: spacing.md,
-        paddingVertical: 8,
-        borderRadius: shapes.roundedPill,
-        marginTop: spacing.xs,
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: 4 },
-        shadowOpacity: 0.15,
-        shadowRadius: 8,
-        elevation: 5,
-        borderWidth: 1,
-        borderColor: 'rgba(225, 29, 72, 0.4)',
-    },
-    viewDetailsBtnChip: {
-        backgroundColor: colors.primary,
-        paddingHorizontal: 12,
-        paddingVertical: 4,
-        borderRadius: shapes.roundedPill,
     },
     factorGrid: {
         flexDirection: 'row',

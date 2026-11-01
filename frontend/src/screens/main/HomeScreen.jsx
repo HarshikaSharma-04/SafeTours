@@ -16,7 +16,6 @@ import * as Location from 'expo-location';
 import { profileService } from '../../services/profile';
 import { formatScore, confidenceText, dataQualityNote, factorLabel } from '../../utils/riskLevels';
 import { getRiskColors } from '../../components/MapComponent';
-import { DemoBadge } from '../../components/DemoBadge';
 import { NearbyServicesCard } from '../../components/NearbyServicesCard';
 import { SafetyTips } from '../../components/SafetyTips';
 import { ensureWatching, getBestPosition } from '../../utils/locationWatcher';
@@ -155,7 +154,6 @@ export const HomeScreen = () => {
                         <View style={styles.heroHeader}>
                             <Text variant="headlineSm" color={colors['on-surface']}>Area Safety</Text>
                             <View style={{ flexDirection: 'row', alignItems: 'center', gap: spacing.sm }}>
-                                {data.risk?.demo && <DemoBadge />}
                                 <Chip label={getRiskColors(data.risk?.riskLevel).label} variant="info" />
                             </View>
                         </View>

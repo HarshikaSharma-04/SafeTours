@@ -26,7 +26,7 @@ async function processNewsUpdates() {
       now,
       meta: (h3Index) => {
         const items = itemsByCell[h3Index];
-        return items ? { source: 'newsdata.io', items: items.slice(0, 3) } : { source: 'newsdata.io', spillover: true };
+        return items ? { source: 'news-feeds', items: items.slice(0, 3) } : { source: 'news-feeds', spillover: true };
       },
     });
     const cleared = await clearComponent('news', { now, except: Object.keys(scores) });

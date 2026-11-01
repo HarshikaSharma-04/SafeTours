@@ -118,6 +118,7 @@ module.exports = {
     batchSize: { location_point: 100, geofence_event: 100 },
     sosImmediateTimeoutMs: 8000, // how long "send now" waits before the SOS is left to the background retry
     smsHoldMs: 30 * 1000, // the upload of an SOS waits at most this long for its SMS attempt to finish
+    smsFirstWaitMs: 6000, // online: the upload starts after the texts went out, or after this long if they are slow
     cap: {
       maxRows: 3000, // live rows (pending / sending / failed / dead)
       pendingMaxAgeMs: 7 * 24 * 3600 * 1000, // older rows are dropped (SOS excepted)
@@ -130,8 +131,11 @@ module.exports = {
   /** SOS text message and its automatic retry window. */
   sms: {
     maxSegments: 2,
-    retryEveryMs: 20 * 1000, // retry a FAILED send (no signal / no service) this often...
-    retryWindowMs: 10 * 60 * 1000, // ...for this long after the SOS was triggered
+    retryEveryMs: 20 * 1000, // retry a FAILED send (no signal / no service) after this long, doubling each try...
+    retryMaxEveryMs: 5 * 60 * 1000, // ...up to this gap (Android warns the user about an app sending many texts)...
+    retryWindowMs: 30 * 60 * 1000, // ...for this long after the SOS was triggered
+    permissionWaitMs: 15 * 1000, // a first SOS waits this long for the SEND_SMS answer before it carries on
+    staleFixMs: 5 * 60 * 1000, // a GPS fix older than this is labelled with its own time in the text
     defaultName: 'A SafeTours user',
     customTextMax: 120,
   },

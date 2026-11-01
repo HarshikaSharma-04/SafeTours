@@ -91,7 +91,118 @@ test('retry: sent, composer_opened and no_permission are never retried by a time
   assert.equal(sms.shouldRetrySms(sms.reduceDirect(null, [{ phone: PHONES[0], ok: true }], 1000), ctx), false);
   assert.equal(sms.shouldRetrySms(sms.reduceComposer(null, 'unknown', PHONES, 1000, null), ctx), false);
   assert.equal(sms.shouldRetrySms(sms.reduceNone(null, 'no_permission', 1000, 3), ctx), false);
-  assert.equal(sms.shouldRetrySms(null, ctx), false);
+});
+
+test('retry: an SOS saved but never texted (app killed) is attempted, inside the window only', () => {
+  assert.equal(sms.shouldRetrySms(null, { now: TRIGGERED + 60000, triggeredAt: TRIGGERED, cfg: smsCfg }), true);
+  assert.equal(sms.shouldRetrySms(null, { now: TRIGGERED + smsCfg.retryWindowMs + 1, triggeredAt: TRIGGERED, cfg: smsCfg }), false);
+});
+
+test('retry: the gap doubles with each try and stops growing at the cap', () => {
+  const at = (attempts, wait) => sms.shouldRetrySms({ outcome: 'failed', via: 'direct', attempts, lastAttemptAt: TRIGGERED }, { now: TRIGGERED + wait, triggeredAt: TRIGGERED, cfg: smsCfg });
+  assert.equal(at(1, smsCfg.retryEveryMs), true);
+  assert.equal(at(2, smsCfg.retryEveryMs), false);
+  assert.equal(at(2, smsCfg.retryEveryMs * 2), true);
+  assert.equal(at(20, smsCfg.retryMaxEveryMs - 1), false);
+  assert.equal(at(20, smsCfg.retryMaxEveryMs), true);
+});
+
+// ── several contacts ─────────────────────────────────────────────────────────────────────────────
+test('numbers: formatting is removed for the radio, a number with nothing dialable is empty', () => {
+  assert.equal(sms.normalizePhone('+91 98000-00001'), '+919800000001');
+  assert.equal(sms.normalizePhone('(022) 2345 6789'), '02223456789');
+  assert.equal(sms.normalizePhone('call me'), '');
+  assert.equal(sms.normalizePhone(null), '');
+});
+
+test('contacts: one text per number however it was typed, and the stored phone is kept', () => {
+  const list = sms.uniqueContacts([{ phone: '+91 98000 00001' }, { phone: '+919800000001' }, { phone: '98000-00002' }, { phone: 'n/a' }]);
+  assert.deepEqual(list.map((c) => c.phone), ['+91 98000 00001', '98000-00002']);
+});
+
+test('sending: one failed contact does not stop the others, and each result is reported as it happens', async () => {
+  const called = [];
+  const seen = [];
+  const results = await sms.sendToEach(PHONES, async (phone) => {
+    called.push(phone);
+    return { phone, ok: phone !== PHONES[1], error: phone === PHONES[1] ? 'generic_failure' : undefined };
+  }, (soFar) => seen.push(soFar.length));
+  assert.deepEqual(called, PHONES);
+  assert.deepEqual(results.map((r) => r.ok), [true, false, true]);
+  assert.deepEqual(seen, [1, 2, 3]);
+  assert.equal(sms.reduceDirect(null, results, 1).outcome, 'partial');
+});
+
+test('sending: no SIM or no signal stops calling the radio, and everyone is reported as not sent', async () => {
+  for (const error of ['no_sim', 'no_service', 'radio_off', 'timeout']) {
+    const called = [];
+    const results = await sms.sendToEach(PHONES, async (phone) => {
+      called.push(phone);
+      return { phone, ok: false, error };
+    });
+    assert.equal(called.length, 1);
+    assert.deepEqual(results.map((r) => [r.phone, r.ok, r.error]), PHONES.map((p) => [p, false, error]));
+    assert.equal(sms.reduceDirect(null, results, 1).outcome, 'failed');
+  }
+});
+
+test('sending: a native exception counts as failed, never as sent', async () => {
+  const results = await sms.sendToEach([PHONES[0]], async () => {
+    throw new Error('boom');
+  });
+  assert.deepEqual(results, [{ phone: PHONES[0], ok: false, error: 'boom' }]);
+});
+
+test('a report saved half way says partial, so a kill at that point still texts only the rest', () => {
+  const half = sms.reduceDirect(sms.emptySms(3), [{ phone: PHONES[0], ok: true }], 1);
+  assert.equal(half.outcome, 'partial');
+  assert.deepEqual(sms.contactsToRetry(half, PHONES.map((phone) => ({ phone }))).map((c) => c.phone), [PHONES[1], PHONES[2]]);
+});
+
+test('reasons are in plain words', () => {
+  assert.match(sms.smsSummary(sms.reduceDirect(null, [{ phone: PHONES[0], ok: false, error: 'no_sim' }], 1)), /no SIM card/);
+  assert.match(sms.smsSummary(sms.reduceDirect(null, [{ phone: PHONES[0], ok: false, error: 'radio_off' }], 1)), /airplane mode/);
+});
+
+// ── pressing SOS more than once ──────────────────────────────────────────────────────────────────
+test('double press: a second call while the first runs gets the same promise, and fn runs once', async () => {
+  let runs = 0;
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const trigger = sms.singleFlight(async () => {
+    runs += 1;
+    await gate;
+    return runs;
+  });
+  const a = trigger();
+  const b = trigger();
+  assert.equal(a, b);
+  release();
+  assert.equal(await a, 1);
+  assert.equal(runs, 1);
+  assert.equal(await trigger(), 2); // free again once finished
+});
+
+test('double press: a failed run does not leave the guard stuck', async () => {
+  let runs = 0;
+  const trigger = sms.singleFlight(async () => {
+    runs += 1;
+    if (runs === 1) throw new Error('storage');
+    return 'ok';
+  });
+  await assert.rejects(trigger());
+  assert.equal(await trigger(), 'ok');
+});
+
+test('a later press joins a recent SOS, delivered or not; cancelled, old and refused-untexted ones do not count', () => {
+  const now = TRIGGERED;
+  const row = (status, payload = {}, age = 1000) => ({ status, payload, createdAt: now - age });
+  for (const s of ['pending', 'sending', 'failed', 'sent']) assert.ok(sms.findReusableSos([row(s)], now), s);
+  assert.equal(sms.findReusableSos([row('sent', { cancelled: true })], now), null);
+  assert.equal(sms.findReusableSos([row('pending', { cancelRequested: true })], now), null);
+  assert.equal(sms.findReusableSos([row('sent', {}, 10 * 60 * 1000)], now), null);
+  assert.equal(sms.findReusableSos([row('dead')], now), null);
+  assert.ok(sms.findReusableSos([row('dead', { sms: { sentTo: [PHONES[0]] } })], now));
 });
 
 // ── what the screen may claim ────────────────────────────────────────────────────────────────────
@@ -139,6 +250,15 @@ test('SOS text has name, map link, accuracy, IST time and the custom text', () =
   assert.equal(m.encoding, 'GSM-7');
   assert.equal(m.segments, 1);
   assert.deepEqual(m.cut, []);
+});
+
+test('an old GPS fix is labelled with its own time; a recent one is not', () => {
+  const base = { name: 'Asha', lat: 19.07612, lng: 72.87771, triggeredAt: TRIGGERED };
+  const old = buildSosSms({ ...base, fixAt: TRIGGERED - 25 * 60 * 1000 });
+  assert.equal(old.text, 'SafeTours SOS: Asha needs help. Loc: https://maps.google.com/?q=19.07612,72.87771, last seen 06 Oct 21:10 IST. 06 Oct 21:35 IST.');
+  const recent = buildSosSms({ ...base, fixAt: new Date(TRIGGERED - 60000).toISOString() });
+  assert.ok(!recent.text.includes('last seen'));
+  assert.ok(!buildSosSms(base).text.includes('last seen')); // age unknown: nothing is claimed
 });
 
 test('a long custom text is shortened to stay within two segments, and the cut is reported', () => {

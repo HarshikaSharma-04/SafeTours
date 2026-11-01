@@ -45,17 +45,22 @@ const mapsLink = (lat, lng) => `https://maps.google.com/?q=${lat.toFixed(5)},${l
 const hasFix = (lat, lng) => Number.isFinite(lat) && Number.isFinite(lng);
 
 /**
- * @param {{name?:string, lat?:number, lng?:number, accuracy?:number, triggeredAt:number|Date, customText?:string, maxSegments?:number}} p
+ * `fixAt` is when the GPS position was taken: a position older than `staleFixMs` is labelled with its own time,
+ * so a contact never reads an old position as the current one. That label is never cut.
+ *
+ * @param {{name?:string, lat?:number, lng?:number, accuracy?:number, fixAt?:number|string, staleFixMs?:number, triggeredAt:number|Date, customText?:string, maxSegments?:number}} p
  * @returns {{text:string, encoding:string, segments:number, units:number, cut:string[]}}
  */
-function buildSosSms({ name, lat, lng, accuracy, triggeredAt, customText, maxSegments = 2 }) {
+function buildSosSms({ name, lat, lng, accuracy, fixAt, staleFixMs = 5 * 60 * 1000, triggeredAt, customText, maxSegments = 2 }) {
   const cut = [];
   let who = oneLine(name) || 'A SafeTours user';
   let custom = oneLine(customText);
   let acc = Number.isFinite(accuracy) ? Math.round(accuracy) : null;
+  const fixMs = fixAt ? new Date(fixAt).getTime() : NaN;
+  const stale = Number.isFinite(fixMs) && new Date(triggeredAt).getTime() - fixMs > staleFixMs ? `, last seen ${formatIst(fixMs)}.` : '';
 
   const compose = () => {
-    const loc = hasFix(lat, lng) ? ` Loc: ${mapsLink(lat, lng)}${acc !== null ? ` (+/-${acc}m)` : ''}` : ' Location unavailable.';
+    const loc = hasFix(lat, lng) ? ` Loc: ${mapsLink(lat, lng)}${acc !== null ? ` (+/-${acc}m)` : ''}${stale}` : ' Location unavailable.';
     return `SafeTours SOS: ${who} needs help.${loc} ${formatIst(triggeredAt)}.${custom ? ` ${custom}` : ''}`;
   };
   const fits = (t) => measure(t).segments <= maxSegments;

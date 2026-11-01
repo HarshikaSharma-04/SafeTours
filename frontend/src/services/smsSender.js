@@ -2,6 +2,7 @@ import { Platform, PermissionsAndroid } from 'react-native';
 import * as SMS from 'expo-sms';
 import { SafeToursSms } from '../../modules/safetours-sms';
 import { kvCache } from '../storage/kvCache';
+import { normalizePhone, sendToEach } from '../offline/smsLogic';
 
 /**
  * Platform layer for the SOS text message. Decisions live in offline/smsLogic.js; this file only touches the OS.
@@ -15,13 +16,21 @@ const ASKED_KEY = 'settings:smsPermissionAsked';
 
 const SEND_SMS = 'android.permission.SEND_SMS';
 
-/** 'granted' | 'denied' | 'undetermined' | 'unavailable' (iOS: there is no such permission) */
+/** False in Expo Go, where our native module is not in the app: a development build is needed for direct texts. */
+export const directSmsSupported = Platform.OS === 'android' && Boolean(SafeToursSms);
+
+/**
+ * 'granted' | 'denied' | 'blocked' (Android will not show the dialog again: only its Settings can change it)
+ * | 'undetermined' (never asked) | 'unavailable' (iOS: there is no such permission)
+ * The OS is the authority on 'granted' (the user can revoke it in Settings); the stored answer says whether we asked.
+ */
 export async function smsPermissionStatus() {
   if (Platform.OS !== 'android') return 'unavailable';
   try {
     if (await PermissionsAndroid.check(SEND_SMS)) return 'granted';
     const asked = await kvCache.get(ASKED_KEY, { allowExpired: true });
-    return asked && asked.value ? 'denied' : 'undetermined';
+    if (!asked || !asked.value) return 'undetermined';
+    return asked.value === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN ? 'blocked' : 'denied';
   } catch (e) {
     return 'undetermined';
   }
@@ -34,13 +43,14 @@ export async function requestSmsPermission() {
     const result = await PermissionsAndroid.request(SEND_SMS, {
       title: 'Allow SafeTours to send SOS texts',
       message:
-        'In an emergency without internet, SafeTours can text your emergency contacts your location straight from this phone. ' +
+        'In an emergency, even without internet, SafeTours can text your emergency contacts your location straight from this phone. ' +
         'Standard SMS charges from your plan may apply. It only sends when you trigger an SOS, or when you press "Test SMS to myself".',
       buttonPositive: 'Allow',
       buttonNegative: 'Not now',
     });
-    await kvCache.set(ASKED_KEY, true);
-    return result === PermissionsAndroid.RESULTS.GRANTED ? 'granted' : 'denied';
+    await kvCache.set(ASKED_KEY, result);
+    if (result === PermissionsAndroid.RESULTS.GRANTED) return 'granted';
+    return result === PermissionsAndroid.RESULTS.NEVER_ASK_AGAIN ? 'blocked' : 'denied';
   } catch (e) {
     return 'denied';
   }
@@ -66,19 +76,20 @@ export async function smsEnvironment() {
 }
 
 /**
- * Sends `message` to every phone directly, in parallel. Resolves to [{phone, ok, error}]; ok is true only when
- * the radio confirmed every part of the message.
+ * Sends `message` to every phone directly, one after another (smsLogic.sendToEach). Resolves to
+ * [{phone, ok, error}]; ok is true only when the radio confirmed every part of the message. `phone` stays as stored
+ * on the contact, only the number handed to the radio is cleaned.
  */
-export async function sendDirect(phones, message) {
-  return Promise.all(
-    phones.map(async (phone) => {
-      try {
-        const res = await SafeToursSms.sendTextAsync(phone, message);
-        return { phone, ok: Boolean(res && res.ok), error: res && res.error ? res.error : undefined };
-      } catch (e) {
-        return { phone, ok: false, error: e.message || 'send failed' };
-      }
-    })
+export function sendDirect(phones, message, onResult) {
+  return sendToEach(
+    phones,
+    async (phone) => {
+      const to = normalizePhone(phone);
+      if (!to) return { phone, ok: false, error: 'invalid_number' };
+      const res = await SafeToursSms.sendTextAsync(to, message);
+      return { phone, ok: Boolean(res && res.ok), error: res && res.error ? res.error : undefined };
+    },
+    onResult
   );
 }
 

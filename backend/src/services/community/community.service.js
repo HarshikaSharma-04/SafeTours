@@ -36,9 +36,9 @@ class CommunityService {
         createdAt: { $gte: since },
         h3CellId: { $in: h3.gridDisk(h3CellId, 2) },
       })
-        .select('userId incidentType latitude longitude createdAt')
+        .select('userId incidentType latitude longitude createdAt description')
         .lean();
-      const dup = communityScoring.classifyDuplicate({ userId, incidentType, latitude, longitude }, candidates, now);
+      const dup = communityScoring.classifyDuplicate({ userId, incidentType, latitude, longitude, description }, candidates, now);
       if (dup.kind === 'own_duplicate') {
         throw new ApiError(409, 'You already reported this nearby a moment ago.');
       }
@@ -73,8 +73,9 @@ class CommunityService {
       const savedIncident = await incident.save();
       logger.info(`[CommunityService.report] Incident reported: ${savedIncident._id} type: ${incidentType} in H3 cell: ${h3CellId}`);
 
-      // 5. Recompute the community component for this cell and its neighbours (async)
-      communityComponent.recomputeAround([h3CellId]).catch((err) => {
+      // 5. Recompute the community component for this cell and its neighbours before answering, so the app's next risk
+      //    read already includes this report. A failure here must not lose the report: the sweep job catches up.
+      await communityComponent.recomputeAround([h3CellId]).catch((err) => {
         logger.error(`[CommunityService.report] Community score recalculation failed for cell ${h3CellId}`, err);
       });
 
@@ -157,7 +158,7 @@ class CommunityService {
       logger.info(`[CommunityService.confirm] Incident ${incidentId} confirmed by user ${userId}`);
 
       // 6. Recalculate H3 Cell score
-      communityComponent.recomputeAround([incident.h3CellId]).catch((err) => {
+      await communityComponent.recomputeAround([incident.h3CellId]).catch((err) => {
         logger.error(`[CommunityService.confirm] Community score recalculation failed for cell ${incident.h3CellId}`, err);
       });
 

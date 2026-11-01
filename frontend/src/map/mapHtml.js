@@ -37,6 +37,15 @@ const LABELS = {
   options: { maxZoom: 19 },
 };
 
+// Runs before Leaflet, so a failure while the page starts still reaches the app instead of leaving a silent blank map.
+const ERROR_HOOK = `
+window.onerror = function (message, source, line) {
+  var text = JSON.stringify({ type: 'error', message: String(message) + ' (line ' + line + ')' });
+  if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(text);
+  else if (window.parent && window.parent !== window) window.parent.postMessage(text, '*');
+};
+`;
+
 const PAGE_CSS = `
 html, body, #map { height: 100%; width: 100%; margin: 0; padding: 0; }
 #map {
@@ -166,7 +175,7 @@ const PAGE_SCRIPT = `
     layers.zones.clearLayers();
     zonesById = {};
     (zones || []).forEach(function (z) {
-      var style = { color: z.stroke, weight: 1, fillColor: z.fill, fillOpacity: z.fillOpacity, opacity: 0.8 };
+      var style = { color: z.stroke, weight: 0.5, fillColor: z.fill, fillOpacity: z.fillOpacity, opacity: 0.5 };
       var shape = z.polygon && z.polygon.length >= 3
         ? L.polygon(toLatLngs(z.polygon), style)
         : L.circle([z.latitude, z.longitude], Object.assign({ radius: z.radius || 200 }, style));
@@ -253,12 +262,61 @@ const PAGE_SCRIPT = `
     );
   }
 
+  // A WebView can start with no size on a phone. Fitting a camera then gives minimum zoom (the whole world), so the
+  // camera waits until the map really has a size.
+  var pendingCamera = null;
+
+  function hasSize() {
+    var el = map.getContainer();
+    return el.clientWidth > 0 && el.clientHeight > 0;
+  }
+
   function moveCamera(region, ms) {
     if (!region) return;
+    if (!hasSize()) {
+      pendingCamera = region;
+      return;
+    }
+    map.invalidateSize({ animate: false });
     var bounds = regionBounds(region);
-    if (ms) map.flyToBounds(bounds, { duration: ms / 1000 });
-    else map.fitBounds(bounds, { animate: false });
+    map.fitBounds(bounds, ms ? { animate: true, duration: ms / 1000 } : { animate: false });
   }
+
+  function onViewportChange() {
+    if (!hasSize()) return;
+    map.invalidateSize({ animate: false });
+    if (pendingCamera) {
+      var region = pendingCamera;
+      pendingCamera = null;
+      moveCamera(region);
+    }
+  }
+
+  // Startup camera moves can leave the base tiles stuck at an old position, all of them off-screen, until the next drag.
+  // That reads as a blank map, so it is repaired here. Tiles that failed to load still count as in view: with no
+  // connection this must not keep asking for them again.
+  function baseTilesInView() {
+    var box = map.getContainer().getBoundingClientRect();
+    var tiles = map.getContainer().querySelectorAll('.leaflet-tile');
+    if (tiles.length === 0) return true; // still loading
+    for (var i = 0; i < tiles.length; i += 1) {
+      var r = tiles[i].getBoundingClientRect();
+      if (r.left < box.right && r.right > box.left && r.top < box.bottom && r.bottom > box.top) return true;
+    }
+    return false;
+  }
+
+  function repairBaseTiles() {
+    if (!baseLayer || !hasSize() || map._animatingZoom || baseTilesInView()) return;
+    baseLayer.redraw();
+    if (labelLayer) labelLayer.redraw();
+  }
+
+  map.on('moveend', function () { setTimeout(repairBaseTiles, 400); });
+  setInterval(repairBaseTiles, 3000);
+
+  window.addEventListener('resize', onViewportChange);
+  if (window.ResizeObserver) new ResizeObserver(onViewportChange).observe(map.getContainer());
 
   map.on('moveend', function () {
     var b = map.getBounds(), c = map.getCenter();
@@ -302,7 +360,7 @@ const PAGE_SCRIPT = `
     }
   });
 
-  post({ type: 'ready' });
+  post({ type: 'ready', width: map.getContainer().clientWidth, height: map.getContainer().clientHeight });
 })();
 `;
 
@@ -328,6 +386,7 @@ function buildMapHtml() {
 <body>
 <div id="map"></div>
 <div id="tile-note">Base map not available right now. Risk cells and pins are still shown.</div>
+<script>${ERROR_HOOK}</script>
 <script>${inline(leaflet.js)}</script>
 <script>${inline(pageScript())}</script>
 </body>

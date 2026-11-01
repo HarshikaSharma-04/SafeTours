@@ -67,6 +67,11 @@ module.exports = {
   // Scores are therefore RELATIVE to the city's own distribution, not absolute.
   normalization: { percentile: 95 },
 
+  // Scoring per locality (services/crime/crimeLocality.js). A cell blends nearby localities, each counting
+  // exp(-(distance / sigma)^2). Past reachMeters one has no effect, and a cell out of reach of all has no score at all.
+  // minShare: a locality is named as a source from this share of the blend. peakScore: the busiest locality in the file.
+  locality: { sigmaMeters: 900, reachMeters: 4500, minShare: 0.15, maxSources: 3, peakScore: 75 },
+
   // Below this many usable incidents the result is flagged lowConfidence (too thin to trust).
   minIncidentsForConfidence: 200,
   // Below this the build script refuses to write (a near-empty file would turn most of the city into

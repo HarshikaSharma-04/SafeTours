@@ -133,6 +133,13 @@ test('duplicates: same user same type nearby recently is rejected; another user 
   assert.equal(merge.incident._id, 'i1');
 });
 
+test('duplicates: the same user describing a different incident is a new report, the same words are a resend', () => {
+  const existing = { _id: 'i1', userId: 'u1', incidentType: 'Theft', latitude: 19.076, longitude: 72.8777, createdAt: new Date(NOW.getTime() - 60000), description: 'Phone snatched near the bus stop' };
+  const base = { userId: 'u1', incidentType: 'Theft', latitude: 19.076, longitude: 72.8777 };
+  assert.equal(scoring.classifyDuplicate({ ...base, description: 'Wallet stolen at the station' }, [existing], NOW).kind, 'new');
+  assert.equal(scoring.classifyDuplicate({ ...base, description: '  phone snatched near the BUS stop ' }, [existing], NOW).kind, 'own_duplicate');
+});
+
 test('duplicates: a different type, a far location or an old report is a new report', () => {
   const existing = { _id: 'i1', userId: 'u1', incidentType: 'Theft', latitude: 19.076, longitude: 72.8777, createdAt: new Date(NOW.getTime() - 10 * 60000) };
   const base = { userId: 'u2', incidentType: 'Theft', latitude: 19.0761, longitude: 72.8777 };

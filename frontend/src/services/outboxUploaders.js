@@ -49,7 +49,8 @@ const senders = {
     // The upload waits for the SMS attempt of this SOS (at most smsHoldMs) so the report it carries is complete.
     if (p.holdUntil && p.holdUntil > ctx.now) return [{ row, outcome: { kind: 'hold', holdMs: p.holdUntil - ctx.now + 250 } }];
 
-    const sms = p.sms && p.sms.outcome ? { outcome: p.sms.outcome, sentTo: p.sms.sentTo || [], total: p.sms.total || 0, attemptedAt: p.sms.lastAttemptAt ? iso(p.sms.lastAttemptAt) : undefined } : undefined;
+    // The server's word for "nobody to text" is 'none': it rejects the whole SOS on an outcome it does not know.
+    const sms = p.sms && p.sms.outcome ? { outcome: p.sms.outcome === 'no_contacts' ? 'none' : p.sms.outcome, sentTo: p.sms.sentTo || [], total: p.sms.total || 0, attemptedAt: p.sms.lastAttemptAt ? iso(p.sms.lastAttemptAt) : undefined } : undefined;
     const body = {
       ...(p.location ? { location: p.location } : {}),
       ...(p.journeyId ? { journeyId: p.journeyId } : {}),

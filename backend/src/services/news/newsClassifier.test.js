@@ -45,3 +45,9 @@ test('non-hazard news is not classified', () => {
   assert.equal(hazard('Mumbai Indians win by five wickets'), null);
   assert.equal(hazard('New metro line opens in Andheri'), null);
 });
+
+test('court and compensation stories about a past event are not a live hazard', () => {
+  assert.strictEqual(classifyArticle({ title: 'Dadar boys orphaned in Eway crash get 3cr, not 6.5cr, as dad 70% liable' }), null);
+  assert.strictEqual(classifyArticle({ title: 'Man convicted over 2019 Bandra building fire' }), null);
+  assert.ok(classifyArticle({ title: 'Fire breaks out at Kurla building' }));
+});

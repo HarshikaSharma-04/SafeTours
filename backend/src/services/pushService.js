@@ -3,7 +3,8 @@ const DeviceToken = require('../models/DeviceToken');
 const logger = require('../utils/logger');
 
 /**
- * Expo push delivery (no Firebase account needed). Uses the Expo push HTTP API directly.
+ * Expo push delivery. Uses the Expo push HTTP API directly (no Firebase code here, but on Android Expo delivers
+ * through FCM, so the FCM V1 key must be uploaded with `eas credentials`).
  *  - only well-formed Expo push tokens are used (a placeholder token is ignored)
  *  - tokens Expo reports as DeviceNotRegistered are deactivated
  *  - never throws: push is best-effort, the in-app poll (GET /api/sos/pending) is the fallback
@@ -49,6 +50,7 @@ async function sendToUser(userId, { title, body, data = {}, channelId = 'safety'
         sent += 1;
       } else {
         failed += 1;
+        logger.warn(`[push] Expo refused a message for user ${userId}: ${tickets[i].details?.error || tickets[i].message}`);
         if (tickets[i].details?.error === 'DeviceNotRegistered') {
           await DeviceToken.updateOne({ user: userId, token: tokens[i] }, { $set: { isActive: false } });
         }

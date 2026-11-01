@@ -9,7 +9,7 @@ import { outboxStore, getCapStats } from '../storage/outboxStore';
 import { outboxRunner } from '../services/outboxRunner';
 import { contactsCache } from '../services/contactsCache';
 import { profileService } from '../services/profile';
-import { smsPermissionStatus } from '../services/smsSender';
+import { smsPermissionStatus, directSmsSupported } from '../services/smsSender';
 import { sendTestSmsToSelf, previewSosSms } from '../services/sosDispatcher';
 import { explainAndRequestSmsPermission } from '../utils/smsPermissionFlow';
 import { formatAge } from '../utils/geo';
@@ -110,7 +110,12 @@ export const EmergencyAlertsSettings = () => {
     );
   };
 
-  const permText = Platform.OS !== 'android' ? 'iPhones cannot send texts silently: the message opens ready and you tap Send.' : perm === 'granted' ? 'Allowed: texts are sent directly from this phone.' : perm === 'denied' ? 'Not allowed: the message opens ready and you tap Send.' : 'Not asked yet: the message opens ready and you tap Send.';
+  const permText = Platform.OS !== 'android' ? 'iPhones cannot send texts silently: the message opens ready and you tap Send.'
+    : !directSmsSupported ? 'This build cannot text directly (Expo Go): the message opens ready and you tap Send. Install the development build.'
+    : perm === 'granted' ? 'Allowed: texts are sent directly from this phone.'
+    : perm === 'blocked' ? 'Blocked in Android settings: the message opens ready and you tap Send. Press Grant to open Settings.'
+    : perm === 'denied' ? 'Not allowed: the message opens ready and you tap Send.'
+    : 'Not asked yet: you will be asked the first time you press SOS.';
 
   return (
     <>
@@ -123,7 +128,7 @@ export const EmergencyAlertsSettings = () => {
         <Row
           title="SMS permission"
           subtitle={permText}
-          right={Platform.OS === 'android' && perm !== 'granted' ? <Pill label="Grant" onPress={grant} /> : null}
+          right={directSmsSupported && perm !== 'granted' ? <Pill label="Grant" onPress={grant} /> : null}
         />
         <Row title="Test SMS to myself" subtitle="Sends one test text to the number in your own profile (nobody else)." right={<Pill label="Send" onPress={test} disabled={busy} />} last />
       </Section>

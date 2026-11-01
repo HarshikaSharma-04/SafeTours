@@ -46,7 +46,7 @@ async function syncDemoCrimeState() {
     return { enabled, action: 'already-seeded' };
   }
 
-  const cells = await GridCell.find({}).select('h3Index center').lean();
+  const cells = await GridCell.find({ 'center.lat': { $type: 'number' }, 'center.lng': { $type: 'number' } }).select('h3Index center').lean();
   if (cells.length === 0) {
     logger.warn('[crime] demo crime data requested but the grid is empty (run the grid generation script).');
     return { enabled, action: 'no-grid' };

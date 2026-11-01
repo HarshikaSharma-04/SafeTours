@@ -18,7 +18,7 @@ const TONE = {
 export const SosStatusCard = ({ view, row, onCancel, onResend, busy }) => {
   const tone = TONE[view.tone] || TONE.warn;
   const sms = row.payload && row.payload.sms;
-  const canResend = onResend && sms && ['failed', 'partial', 'composer_opened', 'no_permission'].includes(sms.outcome) && row.status !== 'sent';
+  const canResend = onResend && sms && ['failed', 'partial', 'composer_opened', 'no_permission'].includes(sms.outcome);
   return (
     <View style={[styles.card, { backgroundColor: tone.bg, borderColor: tone.border }]}>
       <View style={styles.head}>

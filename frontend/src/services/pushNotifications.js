@@ -5,14 +5,16 @@ import Constants, { ExecutionEnvironment } from 'expo-constants';
 import { notificationService } from './notifications';
 
 /**
- * Expo push notifications (expo-notifications SDK 54). No Firebase account is needed: the backend
- * sends through Expo's push service using the Expo push token registered here.
+ * Expo push notifications (expo-notifications SDK 54). The backend sends through Expo's push service using the
+ * Expo push token registered here; on Android, Expo delivers through Firebase Cloud Messaging.
  *
  * Honest limits:
  *  - Expo Go on Android cannot receive remote push since SDK 53: use a development build. (Local
  *    notifications and the in-app polling of /api/sos/pending still work, so the "Are you safe?" prompt
  *    still appears while the app is open.)
  *  - getExpoPushTokenAsync needs an EAS projectId (`eas init` writes extra.eas.projectId into app.json).
+ *  - Android also needs a Firebase project: google-services.json in the build (android.googleServicesFile in
+ *    app.json) for the token, and its FCM V1 key uploaded with `eas credentials` for delivery.
  *  - Android 13+ needs the POST_NOTIFICATIONS permission prompt (requested below).
  */
 
@@ -31,6 +33,12 @@ export async function setupNotificationChannels() {
   await Notifications.setNotificationChannelAsync('default', {
     name: 'General',
     importance: Notifications.AndroidImportance.DEFAULT,
+  });
+  // The channel the backend uses unless it names another (backend notificationService.notify).
+  await Notifications.setNotificationChannelAsync('safety', {
+    name: 'Safety updates',
+    importance: Notifications.AndroidImportance.HIGH,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
   });
   await Notifications.setNotificationChannelAsync('safety-check', {
     name: 'Safety checks ("Are you safe?")',

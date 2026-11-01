@@ -13,6 +13,14 @@ module.exports = {
     'Mumbai AND (fire OR flood OR flooding OR waterlogging OR accident OR collapse OR stampede OR blast OR explosion OR robbery OR stabbing OR murder OR protest OR landslide OR riot)',
   fallbackQuery: 'Mumbai',
   maxPages: 2, // NewsData free plan: 10 articles per request, so 2 requests per run
+  // Publishers' own Mumbai feeds: real-time and keyless. NewsData.io is added on top when it has a key.
+  rssFeeds: [
+    { name: 'Times of India', url: 'https://timesofindia.indiatimes.com/rssfeeds/-2128838597.cms' },
+    { name: 'Hindustan Times', url: 'https://www.hindustantimes.com/feeds/rss/cities/mumbai-news/rssfeed.xml' },
+    { name: 'Indian Express', url: 'https://indianexpress.com/section/cities/mumbai/feed/' },
+    { name: 'Free Press Journal', url: 'https://www.freepressjournal.in/stories.rss?section=mumbai' },
+  ],
+  rssTimeoutMs: 12000,
   maxAgeHours: 24, // older articles are ignored
   halfLifeHours: 6, // contribution halves every 6 hours
 
@@ -24,7 +32,8 @@ module.exports = {
   geocode: { minConfidence: 0.6, maxCandidatesPerArticle: 2 },
 
   // Whole-article skip: not an actual event.
-  nonEvent: /\b(drill|mock|rehearsal|simulation|anniversary|documentary|movie|film|web series|trailer)\b/i,
+  // Includes court and compensation stories: they are about an event in the past, not a hazard happening now.
+  nonEvent: /\b(drill|mock|rehearsal|simulation|anniversary|documentary|movie|film|web series|trailer|compensation|tribunal|liable|verdict|sentenced|convicted|acquitted|bail|chargesheet)\b/i,
   // A match is ignored if one of these appears in the ~35 characters before it.
   negation: /\b(no|not|without|averted|avoid(s|ed)?|prevent(s|ed)?|denies|denied|rules? out|false|fake|rumou?rs?|hoax)\b/i,
 

@@ -132,11 +132,14 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+const sameText = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+
 /**
  * Is a new report a duplicate of an existing active one?
- *   same user, same type, within radius and window  -> 'own_duplicate'   (reject)
+ *   same user, same type, same text, within radius and window -> 'own_duplicate' (reject: an accidental resend)
+ *   same user, same type, different text -> 'new' (a second incident; perUserCellCap still limits its effect on the score)
  *   other user, same type, within radius and window -> 'merge'           (counts as a confirmation of it)
- * @param {{userId:any, incidentType:string, latitude:number, longitude:number}} report
+ * @param {{userId:any, incidentType:string, latitude:number, longitude:number, description?:string}} report
  * @param {Array} candidates active incidents (lean) of the same area
  */
 function classifyDuplicate(report, candidates, now = new Date(), cfg = defaultCfg) {
@@ -148,8 +151,10 @@ function classifyDuplicate(report, candidates, now = new Date(), cfg = defaultCf
     if (now.getTime() - new Date(c.createdAt).getTime() > windowMs) continue;
     const dist = distanceMeters(report.latitude, report.longitude, c.latitude, c.longitude);
     if (dist > d.radiusMeters) continue;
-    const mine = String(c.userId) === String(report.userId);
-    if (mine) return { kind: 'own_duplicate', incident: c, distance: dist };
+    if (String(c.userId) === String(report.userId)) {
+      if (sameText(c.description, report.description)) return { kind: 'own_duplicate', incident: c, distance: dist };
+      continue;
+    }
     if (!best || dist < best.distance) best = { kind: 'merge', incident: c, distance: dist };
   }
   return best || { kind: 'new' };

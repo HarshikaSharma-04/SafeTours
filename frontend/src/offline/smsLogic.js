@@ -93,15 +93,18 @@ function reduceNone(prev, reason, now, total = 0) {
 }
 
 /**
- * Should a failed send be tried again by itself?
- * Only outcomes that mean "the radio could not do it right now" retry (failed, partial), and only inside the
- * window after the SOS was triggered. A denied permission or an opened composer needs the user, not a timer.
+ * Should a send be tried by itself?
+ * No attempt recorded yet (the app was killed right after the SOS was saved), and outcomes that mean "the radio
+ * could not do it right now" (failed, partial), inside the window after the SOS was triggered. The gap doubles on
+ * each try. A denied permission or an opened composer needs the user, not a timer.
  */
 function shouldRetrySms(sms, { now, triggeredAt, cfg }) {
-  if (!sms || !['failed', 'partial'].includes(sms.outcome)) return false;
-  if (sms.via === 'composer') return false; // never re-open the composer on a timer
   if (now - triggeredAt > cfg.retryWindowMs) return false;
-  return sms.lastAttemptAt === null || now - sms.lastAttemptAt >= cfg.retryEveryMs;
+  if (!sms) return true;
+  if (!['failed', 'partial'].includes(sms.outcome)) return false;
+  if (sms.via === 'composer') return false; // never re-open the composer on a timer
+  const gap = Math.min(cfg.retryMaxEveryMs || Infinity, cfg.retryEveryMs * 2 ** Math.max(0, (sms.attempts || 1) - 1));
+  return sms.lastAttemptAt === null || now - sms.lastAttemptAt >= gap;
 }
 
 /** Contacts still to text on a retry (partial: only the ones that failed; failed: everyone). */
@@ -110,6 +113,92 @@ function contactsToRetry(sms, contacts) {
   return contacts.filter((c) => !done.has(c.phone));
 }
 
+/** "+91 98000-00001" -> "+919800000001". '' when nothing dialable is left. */
+function normalizePhone(raw) {
+  const s = String(raw || '').trim();
+  const digits = s.replace(/\D/g, '');
+  return digits.length < 3 ? '' : (s.startsWith('+') ? '+' : '') + digits;
+}
+
+/** Contacts with a dialable number, one per number however it was typed. Keeps each contact's stored phone. */
+function uniqueContacts(contacts) {
+  const seen = new Set();
+  return contacts.filter((c) => {
+    const n = normalizePhone(c.phone);
+    if (!n || seen.has(n)) return false;
+    seen.add(n);
+    return true;
+  });
+}
+
+// These say the phone cannot text anyone right now, so trying the next contact only burns Android's SMS allowance.
+const RADIO_FAILURES = ['no_sim', 'radio_off', 'no_service', 'timeout', 'limit_exceeded', 'no_permission', 'security_exception'];
+
+/**
+ * Texts one phone at a time. Stops calling the radio after a failure that would hit every contact (the rest are
+ * reported with the same error, and are retried later). `onResult` gets the results so far after each contact, so
+ * a kill half way cannot make the retry text someone twice.
+ * @returns {Promise<Array<{phone:string, ok:boolean, error?:string}>>}
+ */
+async function sendToEach(phones, sendOne, onResult) {
+  const results = [];
+  let blocked = null;
+  for (const phone of phones) {
+    let res;
+    if (blocked) res = { phone, ok: false, error: blocked };
+    else {
+      try {
+        res = await sendOne(phone);
+      } catch (e) {
+        res = { phone, ok: false, error: e.message || 'send failed' };
+      }
+    }
+    results.push(res);
+    if (!res.ok && RADIO_FAILURES.includes(res.error)) blocked = res.error;
+    if (onResult) await onResult(results);
+  }
+  return results;
+}
+
+/**
+ * The SOS a new press should join instead of starting another: recent, not cancelled, and either still on its way
+ * or already delivered. A row the server refused is joined only if contacts were already texted from it.
+ */
+function findReusableSos(rows, now, windowMs = 10 * 60 * 1000) {
+  return rows.find((r) => {
+    const p = r.payload || {};
+    if (p.cancelled || p.cancelRequested || now - r.createdAt >= windowMs) return false;
+    if (r.status === 'dead') return Boolean(p.sms && (p.sms.sentTo || []).length);
+    return ['pending', 'sending', 'failed', 'sent'].includes(r.status);
+  }) || null;
+}
+
+/** While a call is running, every other call gets the same promise. The guard is set before anything is awaited. */
+function singleFlight(fn) {
+  let running = null;
+  return (...args) => {
+    if (!running) {
+      running = Promise.resolve()
+        .then(() => fn(...args))
+        .finally(() => {
+          running = null;
+        });
+    }
+    return running;
+  };
+}
+
+const REASON_TEXT = {
+  no_sim: 'no SIM card',
+  radio_off: 'airplane mode or the mobile radio is off',
+  no_service: 'no mobile signal',
+  timeout: 'the network did not confirm it',
+  limit_exceeded: "Android's SMS limit was reached",
+  generic_failure: 'the network refused it',
+  invalid_number: 'invalid phone number',
+};
+const reasonText = (reason) => REASON_TEXT[reason] || reason;
+
 /** "SMS sent to 2 of 3 contacts" */
 function smsSummary(sms) {
   if (!sms || !sms.outcome) return null;
@@ -117,11 +206,11 @@ function smsSummary(sms) {
   const t = sms.total || n;
   switch (sms.outcome) {
     case 'sent': return `SMS sent to ${n} of ${t} contact${t === 1 ? '' : 's'}`;
-    case 'partial': return `SMS sent to ${n} of ${t} contacts (the rest failed)`;
+    case 'partial': return `SMS sent to ${n} of ${t} contacts (the rest failed${REASON_TEXT[sms.reason] ? `: ${REASON_TEXT[sms.reason]}` : ''})`;
     case 'composer_opened': return 'Message opened for you to send: tap Send. We cannot tell whether it was sent';
     case 'no_permission': return 'SMS permission is off, so no text was sent';
     case 'no_contacts': return 'No emergency contacts to text';
-    default: return 'No SMS was sent' + (sms.reason ? ` (${sms.reason})` : '');
+    default: return 'No SMS was sent' + (sms.reason ? ` (${reasonText(sms.reason)})` : '');
   }
 }
 
@@ -178,4 +267,4 @@ function sosView(row) {
   return { headline, tone, chips, detail, pendingNoSignal };
 }
 
-module.exports = { OUTCOMES, planSms, emptySms, reduceDirect, reduceComposer, reduceNone, shouldRetrySms, contactsToRetry, smsSummary, sosView };
+module.exports = { OUTCOMES, planSms, emptySms, reduceDirect, reduceComposer, reduceNone, shouldRetrySms, contactsToRetry, normalizePhone, uniqueContacts, sendToEach, findReusableSos, singleFlight, smsSummary, sosView };

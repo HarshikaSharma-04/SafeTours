@@ -39,6 +39,9 @@ const registerDeviceToken = asyncHandler(async (req, res) => {
     throw new ApiError(400, 'Platform must be either "android" or "ios".');
   }
 
+  // A token belongs to one phone: whoever logged in on it before must stop getting this user's phone's alerts.
+  await DeviceToken.updateMany({ token, user: { $ne: userId } }, { $set: { isActive: false } });
+
   // Upsert: if this user already registered this token, just refresh isActive
   const deviceToken = await DeviceToken.findOneAndUpdate(
     { user: userId, token },

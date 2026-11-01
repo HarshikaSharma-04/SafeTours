@@ -158,7 +158,7 @@ export const SOSScreen = () => {
             source: 'manual',
             reason: 'Manual SOS button pressed by user.',
             journeyId: activeJourney?._id,
-            location: userLocation ? { ...userLocation, timestamp: new Date().toISOString() } : undefined,
+            location: userLocation || undefined, // no timestamp: this fix's age is unknown, and it must not read as "now"
         }).catch((err) => {
             setSosError(err.message || 'Could not start the SOS. Call your local emergency number.');
         });

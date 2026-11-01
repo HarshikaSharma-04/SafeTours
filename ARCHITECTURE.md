@@ -7,7 +7,7 @@ Everything here was read from the code (November 2026). Where your planning note
 ---
 
 ## 1. System overview
-
+      
 ```
  PHONE (Expo / React Native)                               SERVER (Node + Express)                 EXTERNAL
  ┌───────────────────────────────┐                        ┌──────────────────────────────┐

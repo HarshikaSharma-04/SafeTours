@@ -152,7 +152,7 @@ test('fallback: missing data is said plainly, UNKNOWN is never described as safe
   assert.match(unknown.text, /do not have enough data/i);
   assert.ok(!/\bsafe\b.*\bsafe\b/i.test(unknown.text.replace(/cannot say it is safe/i, '')));
   const demo = rules.answerFromContext('is it safe?', await ctxFull({ risk: async () => risk({ demo: true }) }));
-  assert.match(demo.text, /sample \(demo\) data/);
+  assert.match(demo.text, /sample data/);
   const none = rules.answerFromContext('nearest hospital', await ctxFull({ nearby: async () => ({ status: 'unavailable', nearest: {} }) }));
   assert.match(none.text, /could not load nearby places/i);
   assert.match(none.text, /112/);
